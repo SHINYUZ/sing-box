@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/SHINYUZ/sing-box?color=blue) ![Language](https://img.shields.io/badge/language-Bash-green) ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-全能 sing-box 管理脚本，支持多协议配置与管理。
+全能 sing-box 管理脚本，支持多协议配置与管理，支持分流，支持端口流量限额，支持端口限速，支持IPv4/IPv6 优先级策略切换
 
 ---
 
