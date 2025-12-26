@@ -41,3 +41,55 @@ wget
 
 ---
 
+## ⌨️ 快捷指令
+
+安装完毕后，直接输入以下命令即可管理：
+
+```bash
+sb
+```
+
+---
+
+## 🛠 环境要求
+
+- **架构**: AMD64 (x86_64) / ARM64
+- **系统**: Debian / Ubuntu / CentOS 等主流 Linux 发行版
+
+---
+
+## 📂 目录结构
+
+脚本安装后的文件与配置默认路径如下：
+
+```text
+/etc/sing-box/
+├── sing-box              # Sing-box 核心二进制文件
+├── config.json           # 节点主配置文件
+├── vless_pk.conf         # VLESS-Reality 私钥存储文件
+├── tg_notify.conf        # Telegram 通知配置文件
+├── *.crt / *.key         # 各协议的 SSL 证书与密钥文件
+└── limit_*.conf          # 流量限制/限速记录文件
+
+/usr/bin/sb               # 快捷指令软链接
+/etc/systemd/system/      # 系统服务文件 (sing-box.service)
+
+---
+
+## ⚠️ 免责声明
+
+1. 本脚本仅供学习交流使用，请勿用于非法用途。
+2. 使用本脚本造成的任何损失（包括但不限于数据丢失、服务器被封锁等），作者不承担任何责任。
+3. 请遵守当地法律法规。
+
+---
+
+## 📄 开源协议
+
+本项目遵循 [GPL-3.0 License](LICENSE) 协议开源。
+
+Copyright (c) 2025 Shinyuz
+
+---
+
+**如果这个脚本对你有帮助，请给一个 ⭐ Star！**
