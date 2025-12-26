@@ -54,7 +54,7 @@ sb
 ## 🖥️ 主菜单界面
 
 ```text
-========= Sing-box Script v6.9.59 By Shinyuz =========
+========= Sing-box Script v1.9.1 By Shinyuz =========
 
  sing-box: v1.12.14
 
