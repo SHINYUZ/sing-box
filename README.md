@@ -73,6 +73,7 @@ sb
 
 /usr/bin/sb               # 快捷指令软链接
 /etc/systemd/system/      # 系统服务文件 (sing-box.service)
+---
 
 ---
 
