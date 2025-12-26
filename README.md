@@ -1,4 +1,4 @@
-# sing-box Management Script
+# Sing-box Management Script
 
 ![License](https://img.shields.io/github/license/SHINYUZ/sing-box?color=blue) ![Language](https://img.shields.io/badge/language-Bash-green) ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
