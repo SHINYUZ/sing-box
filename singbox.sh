@@ -65,15 +65,61 @@ get_latest_version() {
 }
 
 check_dependencies() {
-    # --- 依赖检查部分保持不变 ---
+    # ==========================================
+    # 1. 强力安装 jq (修复部分机器安装失败问题)
+    # ==========================================
     if ! command -v jq &> /dev/null; then
+        echo -e "${YELLOW}正在安装依赖 jq...${PLAIN}"
+        echo -e "" # 【调整】空一行
+        
+        # [方案A] 尝试使用系统包管理器安装
         if [[ -f /etc/debian_version ]]; then
-            apt-get update && apt-get install -y jq >/dev/null 2>&1
-        else
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y jq >/dev/null 2>&1
+        elif [[ -f /etc/alpine-release ]]; then
+            apk update >/dev/null 2>&1
+            apk add jq >/dev/null 2>&1
+        elif [[ -f /etc/arch-release ]]; then
+            pacman -Sy --noconfirm jq >/dev/null 2>&1
+        elif command -v dnf &> /dev/null; then
+            dnf install -y jq >/dev/null 2>&1
+        elif command -v yum &> /dev/null; then
             yum install -y jq >/dev/null 2>&1
         fi
+
+        # [方案B] 强制模式：如果系统安装失败，直接下载二进制文件 (绝杀)
+        if ! command -v jq &> /dev/null; then
+            echo -e "${YELLOW}系统源安装失败，尝试强制下载 jq 二进制文件...${PLAIN}"
+            echo -e "" # 【调整】空一行
+            
+            # 判断架构
+            ARCH=$(uname -m)
+            case $ARCH in
+                x86_64) jq_arch="amd64" ;;
+                aarch64) jq_arch="arm64" ;;
+                *) echo -e "${RED}错误: 无法强制安装 jq，不支持的架构 $ARCH${PLAIN}"; exit 1 ;;
+            esac
+
+            # 直接下载官方编译好的文件 (使用 ghproxy 加速)
+            wget -O /usr/bin/jq "https://ghproxy.net/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${jq_arch}" >/dev/null 2>&1
+            chmod +x /usr/bin/jq
+            
+            echo -e "${GREEN}jq 强制安装完成${PLAIN}"
+        else
+            echo -e "${GREEN}jq 安装成功${PLAIN}"
+        fi
+
+        # [最终检查]
+        if ! command -v jq &> /dev/null; then
+            echo -e "${RED}错误：依赖 'jq' 彻底安装失败！脚本无法运行。${PLAIN}"
+            exit 1
+        fi
+        echo -e ""
     fi
 
+    # ==========================================
+    # 2. 其他依赖 (nftables, cron)
+    # ==========================================
     if ! command -v nft &> /dev/null; then
         if [[ -f /etc/debian_version ]]; then
             apt-get install -y nftables >/dev/null 2>&1
@@ -92,7 +138,9 @@ check_dependencies() {
         systemctl enable --now cron >/dev/null 2>&1
     fi
 
-    # --- sing-box 安装核心逻辑 (格式优化版) ---
+    # ==========================================
+    # 3. sing-box 安装核心逻辑 (保持原样)
+    # ==========================================
     if [[ ! -f "$SB_BIN" ]]; then
         echo -e "${YELLOW}正在准备安装 sing-box...${PLAIN}"
         echo -e ""  # [空行]
@@ -213,7 +261,7 @@ EOF
         echo -e ""
     fi
     
-    # --- 配置文件检查保持不变 ---
+    # --- 配置文件检查 ---
     if [[ ! -f "$CONFIG_FILE" ]] || ! jq . "$CONFIG_FILE" >/dev/null 2>&1; then
         echo "{ \"log\": { \"level\": \"info\" }, \"inbounds\": [], \"outbounds\": [{\"type\":\"direct\",\"tag\":\"direct\"},{\"type\":\"block\",\"tag\":\"block\"}], \"route\": {\"rules\": [], \"rule_set\": [], \"final\": \"direct\"} }" > $CONFIG_FILE
     else
