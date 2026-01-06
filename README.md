@@ -25,7 +25,7 @@
 
 ## 🚀 安装 (Installation)
 
-推荐使用 root 用户运行：
+复制以下命令并在 VPS 终端中执行：
 
 ```bash
 wget -N --no-check-certificate https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh && chmod +x singbox.sh && ./singbox.sh
