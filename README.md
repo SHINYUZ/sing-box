@@ -28,14 +28,14 @@
 推荐使用 root 用户运行：
 
 ```bash
-wget 
+wget -N --no-check-certificate https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh && chmod +x singbox.sh && ./singbox.sh
 ```
 如果下载失败，请检查 VPS 的网络连接或 DNS 设置
 
 使用镜像加速源下载：
 
 ```bash
-wget
+wget -N --no-check-certificate https://ghproxy.net/https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh && sed -i 's|https://github.com|https://ghproxy.net/https://github.com|g' singbox.sh && chmod +x singbox.sh && ./singbox.sh
 ```
 如果下载失败，请使用其他加速源下载
 
@@ -100,7 +100,7 @@ sb
 
 ```text
 /etc/sing-box/
-├── sing-box              # Sing-box 核心二进制文件
+├── sing-box              # sing-box 核心二进制文件
 ├── config.json           # 节点主配置文件
 ├── vless_pk.conf         # VLESS-Reality 私钥存储文件
 ├── tg_notify.conf        # Telegram 通知配置文件
