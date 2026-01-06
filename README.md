@@ -25,7 +25,7 @@
 
 ## 🚀 安装 (Installation)
 
-复制并执行以下命令：
+复制和执行以下命令：
 
 ```bash
 wget -N --no-check-certificate https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh && chmod +x singbox.sh && ./singbox.sh
