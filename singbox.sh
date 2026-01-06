@@ -124,7 +124,7 @@ check_dependencies() {
             TAG="v1.12.14" # 保底版本
             echo -e "${YELLOW}无法连接 GitHub API，切换至保底版本: ${TAG}${PLAIN}"
             echo -e ""  # [空行]
-            echo -e "网络策略: ${YELLOW}优先镜像源 (IPv6优化)${PLAIN}"
+            echo -e "网络策略: ${YELLOW}优先镜像源${PLAIN}"
             echo -e ""  # [空行]
             USE_MIRROR_FIRST=true
         fi
