@@ -35,9 +35,11 @@ apply_config() {
     if [[ $? -eq 0 ]]; then
         # 2. 尝试重载服务
         if systemctl reload sing-box >/dev/null 2>&1; then
+            init_nftables  # 【新增】重载成功后立即刷新防火墙规则
             return 0
         else
             systemctl restart sing-box
+            init_nftables  # 【新增】重启成功后立即刷新防火墙规则
             return 0
         fi
     else
@@ -347,10 +349,33 @@ send_tg_msg() {
 }
 
 init_nftables() {
+    # 1. 建立基础表和链（如果不存在）
     if ! nft list table inet singbox_stats >/dev/null 2>&1; then
         nft add table inet singbox_stats
         nft add chain inet singbox_stats input_counter { type filter hook input priority 0 \; }
         nft add chain inet singbox_stats output_counter { type filter hook output priority 0 \; }
+    fi
+
+    # 2. 【核心修复】自动扫描当前配置文件中的所有节点端口并添加监控规则
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # 提取所有入站端口
+        local ports=$(jq -r '.inbounds[].listen_port' "$CONFIG_FILE" 2>/dev/null)
+        
+        if [[ -n "$ports" ]]; then
+            for port in $ports; do
+                # 确保端口是数字
+                if [[ "$port" =~ ^[0-9]+$ ]]; then
+                    # 检查入站规则是否存在，不存在则添加
+                    if ! nft list chain inet singbox_stats input_counter | grep "tcp dport $port" >/dev/null 2>&1; then
+                        nft add rule inet singbox_stats input_counter tcp dport $port counter
+                    fi
+                    # 检查出站规则是否存在，不存在则添加
+                    if ! nft list chain inet singbox_stats output_counter | grep "tcp sport $port" >/dev/null 2>&1; then
+                        nft add rule inet singbox_stats output_counter tcp sport $port counter
+                    fi
+                fi
+            done
+        fi
     fi
 }
 
@@ -2827,8 +2852,11 @@ show_traffic() {
             v_len=$(get_visual_length "$tag")
             pad_len=$((30 - v_len))
             padding=$(get_padding "$pad_len")
-            printf "${GREEN}%d.${PLAIN}    %s%s    ${PLAIN}↑${PLAIN} %-12s    ${PLAIN}↓${PLAIN} %-12s    ${PLAIN}总:${PLAIN} %-12s    %b\n" \
+            
+            # 【UI修改】 在箭头前分别加了 出 和 入，并调整了对齐
+            printf "${GREEN}%d.${PLAIN}    %s%s    ${PLAIN}出↑${PLAIN} %-12s    ${PLAIN}入↓${PLAIN} %-12s    ${PLAIN}总:${PLAIN} %-12s    %b\n" \
             "$((i+1))" "$tag" "$padding" "$tx_f" "$rx_f" "$total_f" "$status_text"
+            
             if [[ $i -lt $((count-1)) ]]; then echo -e ""; fi
         done
     fi
