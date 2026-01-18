@@ -3153,11 +3153,13 @@ sb_service_mgr() {
 script_mgr() {
     echo -e " ${GREEN}1.${PLAIN} 开启 BBR"
     echo -e ""
-    echo -e " ${GREEN}2.${PLAIN} 卸载"
+    echo -e " ${GREEN}2.${PLAIN} 更新脚本"
+    echo -e ""
+    echo -e " ${GREEN}3.${PLAIN} 卸载脚本"
     echo -e ""
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo -e ""
-    read -p "请选择[0-2]: " o
+    read -p "请选择[0-3]: " o
     echo -e ""
     case "$o" in
         1) 
@@ -3166,7 +3168,18 @@ script_mgr() {
              sysctl -p >/dev/null 2>&1
              if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then echo -e "${GREEN}BBR+FQ 开启成功！${PLAIN}"; else echo -e "${RED}开启失败，请检查内核版本是否 >= 4.9${PLAIN}"; fi
              ;;
-        2) uninstall ;;
+        2) 
+            echo -e "${GREEN}正在更新脚本...${PLAIN}"
+            echo -e ""
+            # wget -> 成功提示(无前置空行) -> 输出一个空行 -> 延时 -> 重启
+            wget -N --no-check-certificate "https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh" && chmod +x singbox.sh && \
+            echo -e "${GREEN}更新成功！正在重启脚本...${PLAIN}" && \
+            echo -e "" && \
+            sleep 1 && \
+            exec ./singbox.sh
+            exit 0
+            ;;
+        3) uninstall ;;
     esac
     menu
 }
