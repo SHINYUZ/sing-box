@@ -13,6 +13,8 @@ TG_CONF="$WORKDIR/tg_notify.conf"
 SB_BIN="$WORKDIR/sing-box"
 CADDY_BIN="/usr/bin/caddy"
 CADDY_FILE="/etc/caddy/Caddyfile"
+MONITOR_SERVICE="/etc/systemd/system/singbox-traffic.service"
+MONITOR_TIMER="/etc/systemd/system/singbox-traffic.timer"
 SCRIPT_VERSION="v1.9.1"
 FROM_MODIFY=false
 NEED_RELOAD=false
@@ -468,6 +470,34 @@ get_padding() {
     if [[ -z "$length" || ! "$length" =~ ^[0-9]+$ ]]; then length=1; fi
     if [[ "$length" -lt 1 ]]; then length=1; fi
     printf "%${length}s" ""
+}
+
+ensure_monitor_timer() {
+    cat > "$MONITOR_SERVICE" <<EOF
+[Unit]
+Description=Singbox Traffic Monitor
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $(readlink -f $0) monitor
+EOF
+
+    cat > "$MONITOR_TIMER" <<EOF
+[Unit]
+Description=Singbox Traffic Monitor Timer
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=singbox-traffic.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now singbox-traffic.timer >/dev/null 2>&1
 }
 
 check_tag_exists() {
@@ -3046,37 +3076,83 @@ set_traffic_quota() {
     port=$(jq -r ".inbounds[$real].listen_port" $CONFIG_FILE)
     read -p "流量配额(GB, 0取消): " gb
     echo -e ""
-    script_path=$(readlink -f "$0")
     if [[ "$gb" == "0" ]]; then
         rm -f "$WORKDIR/limit_${port}.conf"
         ensure_block_chain
-        nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet singbox_stats input_counter handle $(nft -a list chain inet singbox_stats input_counter | grep "tcp dport $port drop" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet singbox_stats input_counter handle $(nft -a list chain inet singbox_stats input_counter | grep "udp dport $port drop" | awk '{print $NF}') 2>/dev/null
+        while nft -a list chain inet sb_block input | grep -q "tcp dport $port drop"; do
+            nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+        done
+        while nft -a list chain inet sb_block input | grep -q "udp dport $port drop"; do
+            nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+        done
         echo -e "${YELLOW}已取消限制${PLAIN}"
     else
         echo "$gb" > "$WORKDIR/limit_${port}.conf"
         ensure_block_chain
-        cron_job="* * * * * /bin/bash $script_path monitor >/dev/null 2>&1"
-        (crontab -l 2>/dev/null | grep -v "$script_path monitor"; echo "$cron_job") | crontab -
-        
-        # 立刻检查一次并封端口
+        ensure_monitor_timer
+
+        # 立刻检查一次并自动恢复
         read rx tx <<< $(get_port_traffic "$port")
         total=$((rx + tx))
         limit_bytes=$((gb * 1024 * 1024 * 1024))
         if [[ $total -ge $limit_bytes ]]; then
-            nft add rule inet sb_block input tcp dport $port drop
-            nft add rule inet sb_block input udp dport $port drop
+            if ! nft list chain inet sb_block input | grep -q "tcp dport $port drop"; then
+                nft add rule inet sb_block input tcp dport $port drop
+            fi
+            if ! nft list chain inet sb_block input | grep -q "udp dport $port drop"; then
+                nft add rule inet sb_block input udp dport $port drop
+            fi
+        else
+            while nft -a list chain inet sb_block input | grep -q "tcp dport $port drop"; do
+                nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+            done
+            while nft -a list chain inet sb_block input | grep -q "udp dport $port drop"; do
+                nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+            done
         fi
-        
+
         echo -e "${GREEN}设置完成 (已启动后台自动监控)${PLAIN}"
     fi
     echo -e ""
     read -n 1 -s -r -p "按键返回..."
     echo -e ""
+    echo -e ""
     show_traffic
 }
+
+if [[ "$1" == "monitor" ]]; then
+    init_nftables
+    ensure_block_chain
+    for file in $WORKDIR/limit_*.conf; do
+        if [[ -f "$file" ]]; then
+            port=${file#*limit_}
+            port=${port%.conf}
+            limit_gb=$(cat "$file")
+            read rx tx <<< $(get_port_traffic "$port")
+            total=$((rx + tx))
+            limit_bytes=$((limit_gb * 1024 * 1024 * 1024))
+            if [[ $total -ge $limit_bytes ]]; then
+                is_blocked=$(nft list chain inet sb_block input | grep -E "tcp dport $port drop|udp dport $port drop")
+                if [[ -z "$is_blocked" ]]; then
+                    nft add rule inet sb_block input tcp dport $port drop
+                    nft add rule inet sb_block input udp dport $port drop
+                    name=$(jq -r --argjson p "$port" '.inbounds[] | select(.listen_port == $p) | .tag' $CONFIG_FILE)
+                    used_h=$(format_bytes $total)
+                    msg="🚨 [流量耗尽] 节点 ${name} (${port}) 已自动停止 (已用 ${used_h} / 限额 ${limit_gb}GB)"
+                    send_tg_msg "$msg"
+                fi
+            else
+                while nft -a list chain inet sb_block input | grep -q "tcp dport $port drop"; do
+                    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+                done
+                while nft -a list chain inet sb_block input | grep -q "udp dport $port drop"; do
+                    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+                done
+            fi
+        fi
+    done
+    exit 0
+fi
 
 set_port_limit() {
     echo -e "${CYAN}------------ 设置端口限速 ------------${PLAIN}"
@@ -3117,6 +3193,7 @@ set_port_limit() {
     echo -e ""
     read -n 1 -s -r -p "按键返回..."
     echo -e ""
+    echo -e ""
     show_traffic
 }
 
@@ -3150,6 +3227,7 @@ reset_traffic_menu() {
         echo -e "" 
         read -n 1 -s -r -p "按键返回..."
         echo -e ""
+        echo -e ""
         reset_traffic_menu
         return
     fi
@@ -3181,6 +3259,7 @@ reset_traffic_menu() {
         echo -e "" 
         read -n 1 -s -r -p "按键返回..."
         echo -e ""
+        echo -e ""
         reset_traffic_menu
     elif [[ "$op" == "2" ]]; then
         read -p "每月几号(1-31, 0关闭): " d
@@ -3192,6 +3271,7 @@ reset_traffic_menu() {
         echo -e "${GREEN}设置成功${PLAIN}"
         echo -e "" 
         read -n 1 -s -r -p "按键返回..."
+        echo -e ""
         echo -e ""
         reset_traffic_menu
     fi
@@ -3330,6 +3410,11 @@ uninstall() {
              crontab -l 2>/dev/null | grep -v "$current_script" | crontab -
         fi
 
+        systemctl disable --now singbox-traffic.timer >/dev/null 2>&1
+        rm -f "$MONITOR_SERVICE"
+        rm -f "$MONITOR_TIMER"
+        systemctl daemon-reload
+
         echo -e "" 
         echo -e "${GREEN}卸载完成 (全部清理)${PLAIN}"
         echo -e "" 
@@ -3373,7 +3458,6 @@ if [[ "$1" == "monitor" ]]; then
             read rx tx <<< $(get_port_traffic "$port")
             total=$((rx + tx))
             limit_bytes=$((limit_gb * 1024 * 1024 * 1024))
-            echo "$(date) port=$port total=$total limit_bytes=$limit_bytes" >> /tmp/sb_monitor.log
             if [[ $total -ge $limit_bytes ]]; then
                 ensure_block_chain
                 is_blocked=$(nft list chain inet sb_block input | grep -E "tcp dport $port drop|udp dport $port drop")
@@ -3382,9 +3466,16 @@ if [[ "$1" == "monitor" ]]; then
                     nft add rule inet sb_block input udp dport $port drop
                     name=$(jq -r --argjson p "$port" '.inbounds[] | select(.listen_port == $p) | .tag' $CONFIG_FILE)
                     used_h=$(format_bytes $total)
-                    msg="🚨 [流量耗尽] 节点 ${name} (${port}) 已自动停止 (已用 ${used_h} / 限额 ${limit_gb}GB)"
+                    msg="?? [????] ?? ${name} (${port}) ????? (?? ${used_h} / ?? ${limit_gb}GB)"
                     send_tg_msg "$msg"
                 fi
+            else
+                while nft -a list chain inet sb_block input | grep -q "tcp dport $port drop"; do
+                    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+                done
+                while nft -a list chain inet sb_block input | grep -q "udp dport $port drop"; do
+                    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+                done
             fi
         fi
     done
