@@ -45,6 +45,7 @@ apply_config() {
             return 0
         else
             systemctl restart sing-box
+            sleep 1
             init_nftables  # 【新增】重启成功后立即刷新防火墙规则
             return 0
         fi
@@ -3603,6 +3604,7 @@ menu() {
     check_root
     check_dependencies
     create_shortcut
+    init_nftables
     show_banner
     echo -e " ${GREEN}1.${PLAIN} 添加配置"
     echo -e ""
