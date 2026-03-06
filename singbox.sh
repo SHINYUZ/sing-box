@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =========================================================
-# 脚本名称: Sing-box Script By Shinyuz (v1.9.1 - Final Polish)
-# 版本: v1.9.1 (修复随机数/增强卸载/证书逻辑说明)
+# 脚本名称: Sing-box Script By Shinyuz (v1.9.4 - Auto Migration)
+# 版本: v1.9.4 (自动迁移旧config中的domain_strategy)
 # =========================================================
 
 # --- 基础配置 ---
@@ -15,7 +15,7 @@ CADDY_BIN="/usr/bin/caddy"
 CADDY_FILE="/etc/caddy/Caddyfile"
 MONITOR_SERVICE="/etc/systemd/system/singbox-traffic.service"
 MONITOR_TIMER="/etc/systemd/system/singbox-traffic.timer"
-SCRIPT_VERSION="v1.9.1"
+SCRIPT_VERSION="v1.9.4"
 FROM_MODIFY=false
 NEED_RELOAD=false
 VIEW_ONLY=false
@@ -285,11 +285,25 @@ EOF
         fi
     fi
     
+    # [Bug1 Fix] 自动迁移已有 config.json 中残留的旧 domain_strategy 字段
+    if jq -e '[.outbounds[] | select(.domain_strategy != null)] | length > 0' $CONFIG_FILE >/dev/null 2>&1; then
+        jq '(.outbounds[] | select(.domain_strategy != null)) |= (. + {"domain_resolver": {"server": "local-dns", "strategy": .domain_strategy}} | del(.domain_strategy))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+    fi
+
+    # [Bug1 Fix] 自动迁移已有 outbound 中的旧 domain_strategy 字段到 domain_resolver
+    if [[ $(jq '[.outbounds[] | select(.domain_strategy != null)] | length' $CONFIG_FILE) -gt 0 ]]; then
+        jq '(.outbounds[] | select(.domain_strategy != null)) |= (. + {"domain_resolver": {"server": "local-dns", "strategy": .domain_strategy}} | del(.domain_strategy))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+    fi
+
+    # [Bug1 Fix] 确保 dns.servers 中有 local-dns server（domain_resolver 需要）
+    if [[ $(jq '[.dns.servers // [] | .[] | select(.tag == "local-dns")] | length' $CONFIG_FILE) -eq 0 ]]; then
+        jq 'if .dns == null then . + {"dns": {"servers": []}} else . end | if .dns.servers == null then .dns.servers = [] else . end | .dns.servers += [{"type":"local","tag":"local-dns"}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+    fi
     if [[ $(jq '[.outbounds[] | select(.tag == "ipv4-out")] | length' $CONFIG_FILE) -eq 0 ]]; then
-          jq '.outbounds += [{"type":"direct","tag":"ipv4-out","domain_strategy":"ipv4_only"}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+          jq '.outbounds += [{"type":"direct","tag":"ipv4-out","domain_resolver":{"server":"local-dns","strategy":"ipv4_only"}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     fi
     if [[ $(jq '[.outbounds[] | select(.tag == "ipv6-out")] | length' $CONFIG_FILE) -eq 0 ]]; then
-          jq '.outbounds += [{"type":"direct","tag":"ipv6-out","domain_strategy":"ipv6_only"}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+          jq '.outbounds += [{"type":"direct","tag":"ipv6-out","domain_resolver":{"server":"local-dns","strategy":"ipv6_only"}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     fi
 
     if ! systemctl is-active --quiet sing-box; then
@@ -827,7 +841,7 @@ add_ss() {
             2) method="aes-256-gcm"; break ;;
             3) method="chacha20-ietf-poly1305"; break ;; 
             4) method="xchacha20-ietf-poly1305"; break ;;
-            5) method="2022-blake3-aes-128-gcm"; k_len=32; is_2022=true; break ;;
+            5) method="2022-blake3-aes-128-gcm"; k_len=16; is_2022=true; break ;;
             6) method="2022-blake3-aes-256-gcm"; k_len=32; is_2022=true; break ;;
             7) method="2022-blake3-chacha20-poly1305"; k_len=32; is_2022=true; break ;;
             *) continue;; 
@@ -1358,13 +1372,13 @@ add_socks() {
     read -p "请设置用户名(回车随机): " u
     echo -e ""
     if [[ -z "$u" ]]; then u=$($SB_BIN generate rand --hex 10); fi
-    read -p "请设置密码(回车随机): " p
+    read -p "请设置密码(回车随机): " socks_pwd
     echo -e ""
-    if [[ -z "$p" ]]; then p=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40); fi
-    jq --argjson p "$port" --arg u "$u" --arg pwd "$p" --arg tag "$name" \
+    if [[ -z "$socks_pwd" ]]; then socks_pwd=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40); fi
+    jq --argjson p "$port" --arg u "$u" --arg pwd "$socks_pwd" --arg tag "$name" \
         '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":$p,"users":[{"username":$u,"password":$pwd}]}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-    link="socks://$(echo -n "${u}:${p}" | base64 -w 0)@${server_ip}:${port}#${name}"
-    if apply_config; then show_socks_info_display "$server_ip" "$port" "$u" "$p" "$name" "$link"; fi
+    link="socks://$(echo -n "${u}:${socks_pwd}" | base64 -w 0)@${server_ip}:${port}#${name}"
+    if apply_config; then show_socks_info_display "$server_ip" "$port" "$u" "$socks_pwd" "$name" "$link"; fi
 }
 
 show_socks_info_display() {
@@ -1516,7 +1530,7 @@ add_outbound_ss() {
         break
     done
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg m "$method" --arg pwd "$pwd" \
-        '.outbounds += [{"type":"shadowsocks","tag":$t,"server":$s,"server_port":$p,"method":$m,"password":$pwd}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"shadowsocks","tag":$t,"server":$s,"server_port":$p,"method":$m,"password":$pwd}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1550,10 +1564,10 @@ add_outbound_vless() {
     echo -e ""
     if [[ -n "$sid" ]]; then
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     else
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" \
-            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[]}}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     fi
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
@@ -1587,7 +1601,7 @@ add_outbound_vless_ws() {
     read -p "请输入SNI (TLS ServerName): " sni
     echo -e ""
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg path "$path" --arg sni "$sni" \
-        '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"tls":{"enabled":true,"server_name":$sni,"insecure":false},"transport":{"type":"ws","path":$path}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"tls":{"enabled":true,"server_name":$sni,"insecure":false},"transport":{"type":"ws","path":$path}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1616,7 +1630,7 @@ add_outbound_hy2() {
     read -p "请输入SNI: " sni
     echo -e ""
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sn "$sni" \
-        '.outbounds += [{"type":"hysteria2","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"hysteria2","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1647,7 +1661,7 @@ add_outbound_tuic() {
     read -p "请输入SNI: " sni
     echo -e ""
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg pwd "$pwd" --arg sni "$sni" \
-        '.outbounds += [{"type":"tuic","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"password":$pwd,"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sni,"alpn":["h3"]}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"tuic","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"password":$pwd,"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sni,"alpn":["h3"]}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1677,7 +1691,7 @@ add_outbound_trojan() {
     echo -e ""
     if [[ -z "$sni" ]]; then echo -e "${RED}SNI不能为空${PLAIN}"; route_menu; return; fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sni "$sni" \
-        '.outbounds += [{"type":"trojan","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sni}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"trojan","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sni}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1707,7 +1721,7 @@ add_outbound_anytls() {
     echo -e ""
     if [[ -z "$sni" ]]; then echo -e "${RED}SNI不能为空${PLAIN}"; route_menu; return; fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sn "$sni" \
-        '.outbounds += [{"type":"anytls","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"anytls","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1736,7 +1750,7 @@ add_outbound_socks() {
     read -p "请输入密码: " p
     echo -e ""
     jq --arg t "$tag" --arg s "$addr" --argjson port "$port" --arg u "$u" --arg p "$p" \
-        '.outbounds += [{"type":"socks","tag":$t,"server":$s,"server_port":$port,"username":$u,"password":$p}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        '.outbounds += [{"type":"socks","tag":$t,"server":$s,"server_port":$port,"username":$u,"password":$p}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1760,7 +1774,7 @@ block_cn_manager() {
         
         if [[ "$c" == "y" ]]; then
             # 恢复操作：把跟 geoip-cn 和 geosite-cn 有关的阻断规则全部删掉
-            jq 'del(.route.rules[] | select(.outbound == "block" and ((.rule_set | index("geoip-cn") != null) or (.rule_set | index("geosite-cn") != null))))' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            jq 'del(.route.rules[] | select(.outbound == "block" and ((.rule_set | index("geoip-cn") != null) or (.rule_set | index("geosite-cn") != null))))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             
             apply_config
             
@@ -1793,7 +1807,7 @@ block_cn_manager() {
             if [[ -z "$rs_ip" ]]; then
                 jq --arg t "geoip-cn" --arg u "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" \
                    '.route.rule_set += [{"tag": $t, "type": "remote", "format": "binary", "url": $u, "download_detour": "direct"}]' \
-                   $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+                   $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             fi
 
             # 2. 确保下载了 geosite-cn (大陆域名库)
@@ -1801,11 +1815,11 @@ block_cn_manager() {
             if [[ -z "$rs_site" ]]; then
                 jq --arg t "geosite-cn" --arg u "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" \
                    '.route.rule_set += [{"tag": $t, "type": "remote", "format": "binary", "url": $u, "download_detour": "direct"}]' \
-                   $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+                   $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             fi
 
             # 3. 写入“双重阻断”规则：同时包含 IP 和 域名
-            jq '.route.rules = [{"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"}] + .route.rules' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            jq '.route.rules = [{"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"}] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             
             apply_config
             
@@ -1875,7 +1889,7 @@ view_del_route() {
     if [[ "$op" == "1" ]]; then
         read -p "请输入要删除的规则序号: " del_idx
         real_idx=$((del_idx-1))
-        jq "del(.route.rules[$real_idx])" $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        jq "del(.route.rules[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         apply_config
         
         echo -e ""
@@ -1908,7 +1922,7 @@ view_del_route() {
             view_del_route
             return
         fi
-        jq "del(.outbounds[$real_idx])" $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        jq "del(.outbounds[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         apply_config
         
         echo -e ""
@@ -1980,7 +1994,7 @@ add_route_rule() {
             if [[ -z "$exists" ]]; then
                 jq --arg t "$tag_name" --arg u "$url" \
                     '.route.rule_set += [{"tag": $t, "type": "remote", "format": "binary", "url": $u, "download_detour": "direct"}]' \
-                    $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+                    $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             fi
             rule_set_json=$(echo "$rule_set_json" | jq --arg v "$tag_name" '. + [$v]')
         else
@@ -1996,7 +2010,7 @@ add_route_rule() {
     if [[ "$rs_len" -gt 0 ]]; then
         rule_obj=$(echo "$rule_obj" | jq --argjson rs "$rule_set_json" '. + { "rule_set": $rs }')
     fi
-    jq --argjson r "$rule_obj" '.route.rules = [$r] + .route.rules' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+    jq --argjson r "$rule_obj" '.route.rules = [$r] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加规则: [$domains] -> [$target_tag]${PLAIN}"
     sleep 1
@@ -2101,7 +2115,7 @@ mod_ss_menu() {
         2) 
            read -p "请输入新端口: " p
            new_tag="Shadowsocks-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            show_ss_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2113,7 +2127,7 @@ mod_ss_menu() {
            else
                p=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)
            fi
-           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_ss_info "$idx" "密码已更新" 
            ;;
@@ -2159,10 +2173,10 @@ mod_ss_menu() {
            
            if [[ "$need_key" == "true" ]]; then
                p=$($SB_BIN generate rand --base64 $k_len)
-               jq --arg m "$m" --arg p "$p" --argjson i "$idx" '.inbounds[$i].method = $m | .inbounds[$i].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg m "$m" --arg p "$p" --argjson i "$idx" '.inbounds[$i].method = $m | .inbounds[$i].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                show_ss_info "$idx" "加密已更新 (密码已自动重置以匹配协议)"
            else
-               jq --arg m "$m" --argjson i "$idx" '.inbounds[$i].method = $m' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg m "$m" --argjson i "$idx" '.inbounds[$i].method = $m' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                show_ss_info "$idx" "加密已更新" 
            fi
            ;;
@@ -2171,7 +2185,7 @@ mod_ss_menu() {
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                t="${p}-${port}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_ss_info "$idx" "备注已更新"
            else
@@ -2241,14 +2255,14 @@ mod_hy2_menu() {
         2) 
            read -p "请输入新端口: " p
            new_tag="Hysteria2-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_hy2_info "$idx" "端口及备注已更新" 
            ;;
         3) 
            echo -e "${YELLOW}生成密码...${PLAIN}"
            p=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)
-           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_hy2_info "$idx" "密码已更新" 
            ;;
@@ -2257,7 +2271,7 @@ mod_hy2_menu() {
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                t="${p}-${port}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_hy2_info "$idx" "备注已更新"
            else
@@ -2310,21 +2324,21 @@ mod_tuic_menu() {
         2) 
            read -p "请输入新端口: " p
            new_tag="Tuic-V5-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_tuic_info "$idx" "端口及备注已更新" 
            ;;
         3) 
            read -p "UUID(回车随机生成): " u
            if [[ -z "$u" ]]; then u=$($SB_BIN generate uuid); fi
-           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].uuid = $u' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].uuid = $u' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_tuic_info "$idx" "UUID已更新" 
            ;;
         4) 
            echo -e "${YELLOW}生成新密码...${PLAIN}"
            p=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)
-           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_tuic_info "$idx" "密码已更新" 
            ;;
@@ -2333,7 +2347,7 @@ mod_tuic_menu() {
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                t="${p}-${port}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_tuic_info "$idx" "备注已更新"
            else
@@ -2369,13 +2383,13 @@ mod_trojan_menu() {
         2) 
            read -p "请输入新端口: " p
            new_tag="Trojan-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_trojan_info "$idx" "端口及备注已更新" 
            ;;
         3) 
            p=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)
-           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_trojan_info "$idx" "密码已更新" 
            ;;
@@ -2384,7 +2398,7 @@ mod_trojan_menu() {
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                t="${p}-${port}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_trojan_info "$idx" "备注已更新"
            else
@@ -2400,7 +2414,7 @@ mod_trojan_menu() {
            k=$(jq -r ".inbounds[$idx].tls.key_path" $CONFIG_FILE)
            c=$(jq -r ".inbounds[$idx].tls.certificate_path" $CONFIG_FILE)
            openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 -keyout "$k" -out "$c" -subj "/CN=${sni}" >/dev/null 2>&1
-           jq --arg s "$sni" --argjson i "$idx" '.inbounds[$i].tls.server_name = $s' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg s "$sni" --argjson i "$idx" '.inbounds[$i].tls.server_name = $s' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_trojan_info "$idx" "SNI 已更新 (证书已重置)" 
            ;;
@@ -2433,14 +2447,14 @@ mod_anytls_menu() {
         2) 
            read -p "请输入新端口: " p
            new_tag="AnyTLS-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_anytls_info "$idx" "端口及备注已更新" 
            ;;
         3) 
            echo -e "${YELLOW}生成新密码...${PLAIN}"
            p=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)
-           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_anytls_info "$idx" "密码已更新" 
            ;;
@@ -2449,7 +2463,7 @@ mod_anytls_menu() {
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                t="${p}-${port}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_anytls_info "$idx" "备注已更新"
            else
@@ -2465,7 +2479,7 @@ mod_anytls_menu() {
            k=$(jq -r ".inbounds[$idx].tls.key_path" $CONFIG_FILE)
            c=$(jq -r ".inbounds[$idx].tls.certificate_path" $CONFIG_FILE)
            openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 -keyout "$k" -out "$c" -subj "/CN=${sni}" >/dev/null 2>&1
-           jq --arg s "$sni" --argjson i "$idx" '.inbounds[$i].tls.server_name = $s' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg s "$sni" --argjson i "$idx" '.inbounds[$i].tls.server_name = $s' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_anytls_info "$idx" "SNI 已更新 (证书已重置)" 
            ;;
@@ -2512,7 +2526,7 @@ mod_vless_ws_menu() {
         3) 
            read -p "UUID(回车随机生成): " u
            if [[ -z "$u" ]]; then u=$($SB_BIN generate uuid); fi
-           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].uuid = $u' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].uuid = $u' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_vless_ws_info "$idx" "UUID已更新" 
            ;;
@@ -2520,7 +2534,7 @@ mod_vless_ws_menu() {
            read -p "请输入新路径: " path
            if [[ -z "$path" ]]; then path="/"; fi
            if [[ "${path:0:1}" != "/" ]]; then path="/${path}"; fi
-           jq --arg p "$path" --argjson i "$idx" '.inbounds[$i].transport.path = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$path" --argjson i "$idx" '.inbounds[$i].transport.path = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_vless_ws_info "$idx" "路径已更新" 
            ;;
@@ -2528,7 +2542,7 @@ mod_vless_ws_menu() {
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
                t="${p}-443"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_vless_ws_info "$idx" "备注已更新"
            else
@@ -2624,7 +2638,7 @@ mod_vless_menu() {
            read -p "请输入新端口: " p
            old_tag=$(jq -r --argjson i "$idx" '.inbounds[$i].tag' $CONFIG_FILE)
            new_tag="VLESS-REALITY-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            if [[ -f "$PK_FILE" ]]; then sed -i "s/^${old_tag}:/${new_tag}:/" $PK_FILE; fi
            echo -e ""
            show_vless_info "$idx" "端口更新" 
@@ -2632,7 +2646,7 @@ mod_vless_menu() {
         3) 
            read -p "UUID(回车随机生成): " u
            if [[ -z "$u" ]]; then u=$($SB_BIN generate uuid); fi
-           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].uuid = $u' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].uuid = $u' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_vless_info "$idx" "UUID已更新" 
            ;;
@@ -2641,7 +2655,7 @@ mod_vless_menu() {
            kp=$($SB_BIN generate reality-keypair)
            pk=$(echo "$kp"|grep Private|awk -F: '{print $2}'|tr -d ' ')
            pub=$(echo "$kp"|grep Public|awk -F: '{print $2}'|tr -d ' ')
-           jq --arg pk "$pk" --argjson i "$idx" '.inbounds[$i].tls.reality.private_key = $pk' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg pk "$pk" --argjson i "$idx" '.inbounds[$i].tls.reality.private_key = $pk' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            touch $PK_FILE
            sed -i "/^$tag:/d" $PK_FILE
            echo "${tag}:${pub}" >> $PK_FILE
@@ -2654,7 +2668,7 @@ mod_vless_menu() {
            random_sni=${domains[$RANDOM % ${#domains[@]}]}
            read -p "SNI(回车随机生成): " sn
            if [[ -z "$sn" ]]; then sn="$random_sni"; fi
-           jq --arg sn "$sn" --argjson i "$idx" '.inbounds[$i].tls.server_name = $sn | .inbounds[$i].tls.reality.handshake.server = $sn' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg sn "$sn" --argjson i "$idx" '.inbounds[$i].tls.server_name = $sn | .inbounds[$i].tls.reality.handshake.server = $sn' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_vless_info "$idx" "SNI已更新" 
            ;;
@@ -2664,7 +2678,7 @@ mod_vless_menu() {
                current=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                old=$(jq -r --argjson i "$idx" '.inbounds[$i].tag' $CONFIG_FILE)
                t="${p}-${current}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                if [[ -f "$PK_FILE" ]]; then sed -i "s/^${old}:/${t}:/" $PK_FILE; fi
                echo -e ""
                show_vless_info "$idx" "备注已更新"
@@ -2730,19 +2744,19 @@ mod_socks_menu() {
         2) 
            read -p "新端口: " p
            new_tag="Socks5-${p}"
-           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_socks_info "$idx" "端口更新" 
            ;;
         3) 
            read -p "新用户名: " u
-           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].username = $u' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg u "$u" --argjson i "$idx" '.inbounds[$i].users[0].username = $u' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_socks_info "$idx" "用户更新" 
            ;;
         4) 
            read -p "新密码: " p
-           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+           jq --arg p "$p" --argjson i "$idx" '.inbounds[$i].users[0].password = $p' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            echo -e ""
            show_socks_info "$idx" "密码更新" 
            ;;
@@ -2751,7 +2765,7 @@ mod_socks_menu() {
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                t="${p}-${port}"
-               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+               jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                echo -e ""
                show_socks_info "$idx" "备注更新"
            else
@@ -2912,7 +2926,7 @@ del_config() {
     echo -e ""
     
     if [[ "$opt" == "1" ]]; then
-        jq "del(.inbounds[$real_idx])" $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        jq "del(.inbounds[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         apply_config
         
         echo -e "${GREEN}已删除${PLAIN}"
@@ -3486,7 +3500,7 @@ fi
 ipv_menu() {
     echo -e "${CYAN}------------ IPv4/IPv6 优先级与策略 ------------${PLAIN}"
     echo -e ""
-    global_s=$(jq -r '.outbounds[] | select(.tag == "direct") | .domain_strategy // "默认(prefer_ipv4)"' $CONFIG_FILE)
+    global_s=$(jq -r '.outbounds[] | select(.tag == "direct") | .domain_resolver.strategy // "默认(prefer_ipv4)"' $CONFIG_FILE)
     echo -e " 当前全局默认: ${YELLOW}${global_s}${PLAIN}"
     echo -e ""
     echo -e " ${GREEN}1.${PLAIN} 修改全局默认: 优先 IPv4"
@@ -3519,7 +3533,7 @@ ipv_menu() {
 
 set_global_strategy() {
     strategy=$1
-    jq --arg s "$strategy" '(.outbounds[] | select(.tag == "direct")).domain_strategy = $s' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+    jq --arg s "$strategy" '(.outbounds[] | select(.tag == "direct")).domain_resolver = {"server":"local-dns","strategy":$s}' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}全局策略已设置为: $strategy${PLAIN}"
     echo -e ""
@@ -3545,9 +3559,9 @@ set_node_strategy() {
     if [[ "$idx" == "0" ]]; then ipv_menu; return; fi
     if [[ ! "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 ]] || [[ "$idx" -gt "$count" ]]; then ipv_menu; return; fi
     inbound_tag=$(jq -r ".inbounds[$((idx-1))].tag" $CONFIG_FILE)
-    jq --arg t "$inbound_tag" 'del(.route.rules[] | select(.inbound[0] == $t))' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+    jq --arg t "$inbound_tag" 'del(.route.rules[] | select(.inbound[0] == $t))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     new_rule="{ \"inbound\": [\"$inbound_tag\"], \"outbound\": \"$target_outbound\" }"
-    jq --argjson r "$new_rule" '.route.rules = [$r] + .route.rules' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+    jq --argjson r "$new_rule" '.route.rules = [$r] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}设置成功: [${inbound_tag}] -> [${target_outbound}]${PLAIN}"
     echo -e ""
@@ -3571,7 +3585,7 @@ clear_node_strategy() {
     if [[ "$idx" == "0" ]]; then ipv_menu; return; fi
     if [[ ! "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 ]] || [[ "$idx" -gt "$count" ]]; then ipv_menu; return; fi
     inbound_tag=$(jq -r ".inbounds[$((idx-1))].tag" $CONFIG_FILE)
-    jq --arg t "$inbound_tag" 'del(.route.rules[] | select(.inbound[0] == $t))' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+    jq --arg t "$inbound_tag" 'del(.route.rules[] | select(.inbound[0] == $t))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}已重置节点 [${inbound_tag}] 为默认策略${PLAIN}"
     echo -e ""
