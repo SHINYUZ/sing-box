@@ -925,7 +925,7 @@ add_vless() {
     sed -i "/^$name:/d" $PK_FILE
     echo "${name}:${pub}" >> $PK_FILE
     jq --argjson p "$port" --arg u "$uuid" --arg n "$name" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-        '.inbounds += [{"type":"vless","tag":$n,"listen":"::","listen_port":$p,"users":[{"uuid":$u,"name":$n,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        '.inbounds += [{"type":"vless","tag":$n,"listen":"::","listen_port":$p,"users":[{"uuid":$u,"name":$n,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":$sid}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     link="vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=${sni}&pbk=${pub}&fp=chrome&sid=${sid}#${name}"
     if apply_config; then show_vless_info_display "$server_ip" "$port" "$uuid" "$sni" "$pub" "$name" "$link"; fi
 }
@@ -1564,10 +1564,10 @@ add_outbound_vless() {
     echo -e ""
     if [[ -n "$sid" ]]; then
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":$sid}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     else
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" \
-            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":""}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     fi
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
@@ -1630,7 +1630,7 @@ add_outbound_hy2() {
     read -p "请输入SNI: " sni
     echo -e ""
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sn "$sni" \
-        '.outbounds += [{"type":"hysteria2","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        '.outbounds += [{"type":"hysteria2","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn,"insecure":true}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1661,7 +1661,7 @@ add_outbound_tuic() {
     read -p "请输入SNI: " sni
     echo -e ""
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg pwd "$pwd" --arg sni "$sni" \
-        '.outbounds += [{"type":"tuic","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"password":$pwd,"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sni,"alpn":["h3"]}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        '.outbounds += [{"type":"tuic","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"password":$pwd,"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1691,7 +1691,7 @@ add_outbound_trojan() {
     echo -e ""
     if [[ -z "$sni" ]]; then echo -e "${RED}SNI不能为空${PLAIN}"; route_menu; return; fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sni "$sni" \
-        '.outbounds += [{"type":"trojan","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sni}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        '.outbounds += [{"type":"trojan","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1721,7 +1721,7 @@ add_outbound_anytls() {
     echo -e ""
     if [[ -z "$sni" ]]; then echo -e "${RED}SNI不能为空${PLAIN}"; route_menu; return; fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sn "$sni" \
-        '.outbounds += [{"type":"anytls","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        '.outbounds += [{"type":"anytls","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn,"insecure":true}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
     echo -e "${GREEN}[成功] 已添加出口: $tag${PLAIN}"
     sleep 1
@@ -1859,7 +1859,7 @@ view_del_route() {
             display=""
             if [[ -n "$inb" ]]; then display="Inbound:[$inb] "; fi
             if [[ -n "$dom" ]]; then display="${display}Domain:$dom "; fi
-            if [[ -n "$rs" ]]; then display="${display}RuleSet:$rs"; fi
+            if [[ -n "$rs" ]]; then rs_display=$(echo "$rs" | sed 's/geosite-/geosite:/g; s/geoip-/geoip:/g'); display="${display}RuleSet:$rs_display"; fi
             echo -e " ${GREEN}$((i+1)).${PLAIN} 规则: [${SKY}$display${PLAIN}] -> [${YELLOW}$out${PLAIN}]"
             echo -e ""
         done
