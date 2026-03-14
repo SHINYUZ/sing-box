@@ -925,7 +925,7 @@ add_vless() {
     sed -i "/^$name:/d" $PK_FILE
     echo "${name}:${pub}" >> $PK_FILE
     jq --argjson p "$port" --arg u "$uuid" --arg n "$name" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-        '.inbounds += [{"type":"vless","tag":$n,"listen":"::","listen_port":$p,"users":[{"uuid":$u,"name":$n,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":$sid}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        '.inbounds += [{"type":"vless","tag":$n,"listen":"::","listen_port":$p,"users":[{"uuid":$u,"name":$n,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     link="vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=${sni}&pbk=${pub}&fp=chrome&sid=${sid}#${name}"
     if apply_config; then show_vless_info_display "$server_ip" "$port" "$uuid" "$sni" "$pub" "$name" "$link"; fi
 }
@@ -1564,7 +1564,7 @@ add_outbound_vless() {
     echo -e ""
     if [[ -n "$sid" ]]; then
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":$sid}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     else
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" \
             '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":""}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
@@ -2655,7 +2655,8 @@ mod_vless_menu() {
            kp=$($SB_BIN generate reality-keypair)
            pk=$(echo "$kp"|grep Private|awk -F: '{print $2}'|tr -d ' ')
            pub=$(echo "$kp"|grep Public|awk -F: '{print $2}'|tr -d ' ')
-           jq --arg pk "$pk" --argjson i "$idx" '.inbounds[$i].tls.reality.private_key = $pk' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+           new_sid=$($SB_BIN generate rand --hex 8)
+           jq --arg pk "$pk" --arg sid "$new_sid" --argjson i "$idx" '.inbounds[$i].tls.reality.private_key = $pk | .inbounds[$i].tls.reality.short_id = [$sid]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            touch $PK_FILE
            sed -i "/^$tag:/d" $PK_FILE
            echo "${tag}:${pub}" >> $PK_FILE
