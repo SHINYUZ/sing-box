@@ -1759,23 +1759,20 @@ add_outbound_socks() {
 }
 
 block_cn_manager() {
-    # 检查当前是否已经存在屏蔽规则
-    # 只要检测到有针对 geoip-cn 或 geosite-cn 的阻断规则，就视为“已开启”
     is_blocked=$(jq '.route.rules[]? | select(.outbound == "block" and ((.rule_set | index("geoip-cn") != null) or (.rule_set | index("geosite-cn") != null)))' $CONFIG_FILE 2>/dev/null)
 
     echo -e "${CYAN}>>> 屏蔽/恢复 大陆管理${PLAIN}"
     echo -e ""
 
     if [[ -n "$is_blocked" ]]; then
-        # === 当前状态：已屏蔽大陆 ===
         echo -e "当前状态: ${GREEN}已屏蔽大陆${PLAIN}"
         echo -e ""
         read -p "是否恢复大陆流量? (y/n): " c
         
         if [[ "$c" == "y" ]]; then
-            # 恢复操作：把跟 geoip-cn 和 geosite-cn 有关的阻断规则全部删掉
             jq 'del(.route.rules[] | select(.outbound == "block" and ((.rule_set | index("geoip-cn") != null) or (.rule_set | index("geosite-cn") != null))))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-            
+            # 【Bug修复】清理不再被任何规则引用的孤立 rule_set 条目（含 geoip-cn / geosite-cn）
+            jq '([ .route.rules[]?.rule_set? // [] ] | add // []) as $used | .route.rule_set = [ .route.rule_set[]? | select( .tag as $t | ($used | index($t)) != null ) ]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             apply_config
             
             echo -e "" 
@@ -1796,13 +1793,11 @@ block_cn_manager() {
             route_menu
         fi
     else
-        # === 当前状态：未屏蔽大陆 ===
         echo -e "当前状态: ${GREEN}未屏蔽大陆${PLAIN}"
         echo -e ""
         read -p "是否屏蔽大陆流量? (y/n): " c
 
         if [[ "$c" == "y" ]]; then
-            # 1. 确保下载了 geoip-cn (大陆IP库)
             rs_ip=$(jq '.route.rule_set[]? | select(.tag == "geoip-cn")' $CONFIG_FILE)
             if [[ -z "$rs_ip" ]]; then
                 jq --arg t "geoip-cn" --arg u "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" \
@@ -1810,7 +1805,6 @@ block_cn_manager() {
                    $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             fi
 
-            # 2. 确保下载了 geosite-cn (大陆域名库)
             rs_site=$(jq '.route.rule_set[]? | select(.tag == "geosite-cn")' $CONFIG_FILE)
             if [[ -z "$rs_site" ]]; then
                 jq --arg t "geosite-cn" --arg u "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" \
@@ -1818,7 +1812,6 @@ block_cn_manager() {
                    $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             fi
 
-            # 3. 写入“双重阻断”规则：同时包含 IP 和 域名
             jq '.route.rules = [{"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"}] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             
             apply_config
@@ -1849,7 +1842,7 @@ view_del_route() {
     rcount=$(jq '.route.rules | length' $CONFIG_FILE)
     if [[ "$rcount" -eq 0 ]]; then
         echo -e " ${YELLOW}暂无规则${PLAIN}"
-        echo -e "" # 保持之前的修复：这里加空行
+        echo -e ""
     else
         for ((i=0; i<$rcount; i++)); do
             out=$(jq -r ".route.rules[$i].outbound" $CONFIG_FILE)
@@ -1890,6 +1883,8 @@ view_del_route() {
         read -p "请输入要删除的规则序号: " del_idx
         real_idx=$((del_idx-1))
         jq "del(.route.rules[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        # 【Bug修复】清理不再被任何规则引用的孤立 rule_set 条目
+        jq '([ .route.rules[]?.rule_set? // [] ] | add // []) as $used | .route.rule_set = [ .route.rule_set[]? | select( .tag as $t | ($used | index($t)) != null ) ]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         apply_config
         
         echo -e ""
@@ -1898,7 +1893,7 @@ view_del_route() {
         
         read -n 1 -s -r -p "按任意键返回..."
         echo -e ""
-        echo -e "" # 【关键】下方空一行
+        echo -e ""
         view_del_route
     fi
 
@@ -1931,7 +1926,7 @@ view_del_route() {
         
         read -n 1 -s -r -p "按任意键返回..."
         echo -e ""
-        echo -e "" # 【关键】下方空一行
+        echo -e ""
         view_del_route
     fi
 }
