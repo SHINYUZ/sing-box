@@ -51,7 +51,9 @@ apply_config() {
         fi
     else
         echo -e "${RED}配置文件校验失败！sing-box 可能无法启动。${PLAIN}"
+        echo -e ""
         echo -e "${PLAIN}$check_output${PLAIN}"
+        echo -e ""
         read -n 1 -s -r -p "按任意键返回..."
         echo -e ""
         echo -e ""
@@ -927,7 +929,7 @@ add_vless() {
     jq --argjson p "$port" --arg u "$uuid" --arg n "$name" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
         '.inbounds += [{"type":"vless","tag":$n,"listen":"::","listen_port":$p,"users":[{"uuid":$u,"name":$n,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     link="vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=${sni}&pbk=${pub}&fp=chrome&sid=${sid}#${name}"
-    if apply_config; then show_vless_info_display "$server_ip" "$port" "$uuid" "$sni" "$pub" "$name" "$link"; fi
+    if apply_config; then show_vless_info_display "$server_ip" "$port" "$uuid" "$sni" "$pub" "$sid" "$name" "$link"; fi
 }
 
 show_vless_info_display() {
@@ -945,15 +947,17 @@ show_vless_info_display() {
     echo -e ""
     printf " %-24s = ${PLAIN}%s${PLAIN}\n" "传输 (TLS)" "reality"
     echo -e ""
-    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "SNI (serverName)" "$4"
+    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "SNI (ServerName)"    "$4"
     echo -e ""
-    printf " %-24s = ${PLAIN}%s${PLAIN}\n" "公钥 (Public key)" "$5"
+    printf " %-24s = ${PLAIN}%s${PLAIN}\n" "公钥 (PublicKey)"     "$5"
     echo -e ""
-    printf " %-24s = ${PLAIN}%s${PLAIN}\n" "备注 (name)" "$6"
+    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "ShortId"              "$6"
+    echo -e ""
+    printf " %-24s = ${PLAIN}%s${PLAIN}\n" "备注 (name)"           "$7"
     echo -e ""
     echo -e "${PLAIN}------------- 链接 (URL) -------------${PLAIN}"
     echo -e ""
-    echo -e "${SKY}$7${PLAIN}"
+    echo -e "${SKY}$8${PLAIN}"
     echo -e ""
     echo -e "${PLAIN}------------- END -------------${PLAIN}"
     echo -e ""
@@ -1240,7 +1244,7 @@ show_trojan_info_display() {
     echo -e ""
     printf " %-24s = ${PLAIN}%s${PLAIN}\n" "安全 (security)" "tls"
     echo -e ""
-    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "SNI (serverName)" "$4"
+    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "SNI (ServerName)" "$4"
     echo -e ""
     printf " %-24s = ${PLAIN}%s${PLAIN}\n" "备注 (name)" "$5"
     echo -e ""
@@ -1328,7 +1332,7 @@ show_anytls_info_display() {
     echo -e ""
     printf " %-24s = ${PLAIN}%s${PLAIN}\n" "安全 (security)" "tls"
     echo -e ""
-    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "SNI (serverName)" "$4"
+    printf " %-22s = ${PLAIN}%s${PLAIN}\n" "SNI (ServerName)" "$4"
     echo -e ""
     printf " %-24s = ${PLAIN}%s${PLAIN}\n" "备注 (name)" "$5"
     echo -e ""
@@ -1564,7 +1568,7 @@ add_outbound_vless() {
     echo -e ""
     if [[ -n "$sid" ]]; then
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+            '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":$sid}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     else
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" \
             '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":""}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
@@ -1837,93 +1841,110 @@ block_cn_manager() {
 }
 
 view_del_route() {
-    echo -e "${CYAN}------------ 当前分流规则 (Current Rules) ------------${PLAIN}"
+    echo -e "${CYAN}------------ Current Rules ------------${PLAIN}"
     echo -e ""
     rcount=$(jq '.route.rules | length' $CONFIG_FILE)
-    if [[ "$rcount" -eq 0 ]]; then
-        echo -e " ${YELLOW}暂无规则${PLAIN}"
+    if [[ $rcount -eq 0 ]]; then
+        echo -e "${YELLOW}暂无分流规则${PLAIN}"
         echo -e ""
     else
         for ((i=0; i<$rcount; i++)); do
             out=$(jq -r ".route.rules[$i].outbound" $CONFIG_FILE)
-            dom=$(jq -r ".route.rules[$i].domain // [] | join(\",\")" $CONFIG_FILE)
-            rs=$(jq -r ".route.rules[$i].rule_set // [] | join(\",\")" $CONFIG_FILE)
-            inb=$(jq -r ".route.rules[$i].inbound // [] | join(\",\")" $CONFIG_FILE)
-            display=""
-            if [[ -n "$inb" ]]; then display="Inbound:[$inb] "; fi
-            if [[ -n "$dom" ]]; then display="${display}Domain:$dom "; fi
-            if [[ -n "$rs" ]]; then rs_display=$(echo "$rs" | sed 's/geosite-/geosite:/g; s/geoip-/geoip:/g'); display="${display}RuleSet:$rs_display"; fi
-            echo -e " ${GREEN}$((i+1)).${PLAIN} 规则: [${SKY}$display${PLAIN}] -> [${YELLOW}$out${PLAIN}]"
+            dom=$(jq -r ".route.rules[$i].domain // [] | join(\", \")" $CONFIG_FILE)
+            rs=$(jq -r ".route.rules[$i].rule_set // [] | join(\", \")" $CONFIG_FILE)
+            inb=$(jq -r ".route.rules[$i].inbound // [] | join(\", \")" $CONFIG_FILE)
+
+            rule_display=""
+            if [[ -n "$dom" && -n "$rs" ]]; then
+                rsdisplay=$(echo "$rs" | sed 's/geosite-/geosite:/g' | sed 's/geoip-/geoip:/g')
+                rule_display="${dom}, ${rsdisplay}"
+            elif [[ -n "$dom" ]]; then
+                rule_display="$dom"
+            elif [[ -n "$rs" ]]; then
+                rule_display=$(echo "$rs" | sed 's/geosite-/geosite:/g' | sed 's/geoip-/geoip:/g')
+            fi
+
+            printf " ${GREEN}%d.${PLAIN}  %-6s: ${YELLOW}%s${PLAIN}\n" "$((i+1))" "出口" "$out"
             echo -e ""
+            printf "     %-6s: ${SKY}%s${PLAIN}\n" "规则" "$rule_display"
+            echo -e ""
+            if [[ -n "$inb" ]]; then
+                printf "     %-6s: ${PLAIN}%s${PLAIN}\n" "入站" "$inb"
+                echo -e ""
+            fi
         done
     fi
-    echo -e "${CYAN}------------ 自定义出口 (Outbounds) ------------${PLAIN}"
+    echo -e "${CYAN}------------ Outbounds ------------${PLAIN}"
     echo -e ""
     ocount=$(jq '.outbounds | length' $CONFIG_FILE)
     for ((i=0; i<$ocount; i++)); do
         tag=$(jq -r ".outbounds[$i].tag" $CONFIG_FILE)
         type=$(jq -r ".outbounds[$i].type" $CONFIG_FILE)
-        echo -e " ${GREEN}N$((i+1)).${PLAIN} 节点: [${YELLOW}$tag${PLAIN}] ($type)"
+        if [[ "$type" == "vless" ]]; then
+            if [[ $(jq -r ".outbounds[$i].tls.reality.enabled // false" $CONFIG_FILE) == "true" ]]; then
+                display_type="vless-reality"
+            elif [[ $(jq -r ".outbounds[$i].transport.type // empty" $CONFIG_FILE) == "ws" ]]; then
+                display_type="vless-ws"
+            else
+                display_type="vless"
+            fi
+        else
+            display_type="$type"
+        fi
+        echo -e " ${GREEN}$((i+1)).${PLAIN} ${YELLOW}${tag}${PLAIN} ${display_type}"
         echo -e ""
     done
     echo -e "------------------------------------------------------"
     echo -e ""
-    echo -e " ${GREEN}1.${PLAIN} 删除规则 (输入序号 1, 2...)"
+    echo -e " ${GREEN}1.${PLAIN} 删除规则 (输入序号, 如 1、2...)"
     echo -e ""
-    echo -e " ${GREEN}2.${PLAIN} 删除出口节点 (输入序号 N3, N4...)"
+    echo -e " ${GREEN}2.${PLAIN} 删除出口节点 (输入序号, 如 1、2...)"
     echo -e ""
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo -e ""
-    read -p "请选择[0-2]: " op
+    read -p " 请选择[0-2]: " op
     echo -e ""
     if [[ "$op" == "0" ]]; then route_menu; return; fi
-    
-    # === 删除规则逻辑 ===
+
     if [[ "$op" == "1" ]]; then
-        read -p "请输入要删除的规则序号: " del_idx
-        real_idx=$((del_idx-1))
-        jq "del(.route.rules[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-        # 【Bug修复】清理不再被任何规则引用的孤立 rule_set 条目
-        jq '([ .route.rules[]?.rule_set? // [] ] | add // []) as $used | .route.rule_set = [ .route.rule_set[]? | select( .tag as $t | ($used | index($t)) != null ) ]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        read -p "请输入要删除的规则序号: " delidx
+        echo -e ""
+        realidx=$((delidx-1))
+        jq "del(.route.rules[$realidx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        jq '([.route.rules[]? | .rule_set? // [] | .[]] | unique) as $used | .route.rule_set = [.route.rule_set[]? | select(.tag as $t | ($used | index($t)) != null)]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         apply_config
-        
+        echo -e "${GREEN}已删除规则 $delidx${PLAIN}"
         echo -e ""
-        echo -e "${GREEN}规则已删除${PLAIN}"
-        echo -e ""
-        
         read -n 1 -s -r -p "按任意键返回..."
         echo -e ""
         echo -e ""
         view_del_route
     fi
 
-    # === 删除节点逻辑 ===
     if [[ "$op" == "2" ]]; then
-        read -p "请输入要删除的节点序号 (数字即可，不加N): " del_idx
-        real_idx=$((del_idx-1))
-        tag=$(jq -r ".outbounds[$real_idx].tag" $CONFIG_FILE)
+        read -p "请输入要删除的出口序号: " delidx
+        echo -e ""
+        realidx=$((delidx-1))
+        tag=$(jq -r ".outbounds[$realidx].tag" $CONFIG_FILE)
         if [[ "$tag" == "direct" || "$tag" == "block" ]]; then
-            echo -e "${RED}错误：不能删除默认的 direct 或 block 出口！${PLAIN}"
+            echo -e "${RED}direct 和 block 不可删除${PLAIN}"
             sleep 1
             echo -e ""
             view_del_route
             return
         fi
-        in_use=$(jq --arg t "$tag" '.route.rules[] | select(.outbound == $t)' $CONFIG_FILE)
-        if [[ -n "$in_use" ]]; then
-            echo -e "${RED}错误：该节点正在被分流规则使用，请先删除对应规则！${PLAIN}"
+        inuse=$(jq --arg t "$tag" '.route.rules[] | select(.outbound == $t)' $CONFIG_FILE)
+        if [[ -n "$inuse" ]]; then
+            echo -e "${RED}该出口节点正在被规则使用，请先删除对应规则${PLAIN}"
             sleep 2
             echo -e ""
             view_del_route
             return
         fi
-        jq "del(.outbounds[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        jq "del(.outbounds[$realidx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         apply_config
-        
+        echo -e "${GREEN}已删除出口节点: $tag${PLAIN}"
         echo -e ""
-        echo -e "${GREEN}节点 $tag 已删除${PLAIN}"
-        echo -e ""
-        
         read -n 1 -s -r -p "按任意键返回..."
         echo -e ""
         echo -e ""
@@ -1936,6 +1957,42 @@ add_route_rule() {
     echo -e ""
     read -p "请输入目标域名 (多个用逗号分隔, 支持 geosite:xxx): " domains
     echo -e ""
+
+    inb_count=$(jq '.inbounds | length' $CONFIG_FILE)
+    selected_inbounds="[]"
+
+    if [[ "$inb_count" -gt 0 ]]; then
+        echo -e "此规则应用于哪些入站节点？"
+        echo -e ""
+        echo -e " ${GREEN}1.${PLAIN} 所有节点都生效"
+        echo -e ""
+        echo -e " ${GREEN}2.${PLAIN} 只对指定节点生效"
+        echo -e ""
+        read -p "请选择[1-2]: " inb_opt
+        echo -e ""
+
+        if [[ "$inb_opt" == "2" ]]; then
+            echo -e "请选择入站节点 (多个用逗号分隔，如 1,3):"
+            echo -e ""
+            for ((i=0; i<$inb_count; i++)); do
+                itag=$(jq -r ".inbounds[$i].tag" $CONFIG_FILE)
+                echo -e " ${GREEN}$((i+1)).${PLAIN} $itag"
+                echo -e ""
+            done
+            read -p "请输入序号: " inb_selection
+            echo -e ""
+
+            IFS=',' read -ra INB_ITEMS <<< "$inb_selection"
+            for inb_idx in "${INB_ITEMS[@]}"; do
+                inb_idx=$(echo "$inb_idx" | tr -d ' ')
+                if [[ "$inb_idx" =~ ^[0-9]+$ ]] && [[ "$inb_idx" -ge 1 ]] && [[ "$inb_idx" -le "$inb_count" ]]; then
+                    inb_tag=$(jq -r ".inbounds[$((inb_idx-1))].tag" $CONFIG_FILE)
+                    selected_inbounds=$(echo "$selected_inbounds" | jq --arg v "$inb_tag" '. + [$v]')
+                fi
+            done
+        fi
+    fi
+
     echo -e "请选择流量去向 (Target Outbound):"
     echo -e ""
     count=$(jq '.outbounds | length' $CONFIG_FILE)
@@ -1947,7 +2004,6 @@ add_route_rule() {
         else
             port=$(jq -r ".outbounds[$i].server_port // empty" $CONFIG_FILE)
             if [[ "$type" == "vless" ]]; then
-                # 简单判断是 Reality, WS
                 if [[ $(jq -r ".outbounds[$i].tls.reality.enabled" $CONFIG_FILE) == "true" ]]; then
                     display_type="vless-reality"
                 elif [[ $(jq -r ".outbounds[$i].transport.type" $CONFIG_FILE) == "ws" ]]; then
@@ -1966,21 +2022,33 @@ add_route_rule() {
                 display_info="(${display_type})"
             fi
         fi
-        printf " ${GREEN}%d.${PLAIN} %-20s %s\n" "$((i+1))" "$tag" "$display_info"
+        tag_line=" ${GREEN}$((i+1)).${PLAIN} ${tag}"
+        vis=$(get_visual_length "$tag_line")
+        pad=$(get_padding $((28 - vis)))
+        echo -e "${tag_line}${pad}${display_info}"
         echo -e ""
     done
+
     read -p "请选择[1-$count]: " idx
     echo -e ""
+
     if [[ ! "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 ]] || [[ "$idx" -gt "$count" ]]; then
         echo -e "${RED}无效选择${PLAIN}"
         route_menu
         return
     fi
+
     target_tag=$(jq -r ".outbounds[$((idx-1))].tag" $CONFIG_FILE)
+
     domain_json="[]"
     rule_set_json="[]"
+
     IFS=',' read -ra ITEMS <<< "$domains"
     for item in "${ITEMS[@]}"; do
+        item=$(echo "$item" | xargs)
+        if [[ -z "$item" ]]; then
+            continue
+        fi
         if [[ "$item" == geosite:* ]]; then
             site_name=${item#geosite:}
             tag_name="geosite-${site_name}"
@@ -1996,20 +2064,29 @@ add_route_rule() {
             domain_json=$(echo "$domain_json" | jq --arg v "$item" '. + [$v]')
         fi
     done
+
     rule_obj="{ \"outbound\": \"$target_tag\" }"
+
     d_len=$(echo "$domain_json" | jq 'length')
     rs_len=$(echo "$rule_set_json" | jq 'length')
+    inb_len=$(echo "$selected_inbounds" | jq 'length')
+
     if [[ "$d_len" -gt 0 ]]; then
         rule_obj=$(echo "$rule_obj" | jq --argjson d "$domain_json" '. + { "domain": $d }')
     fi
     if [[ "$rs_len" -gt 0 ]]; then
         rule_obj=$(echo "$rule_obj" | jq --argjson rs "$rule_set_json" '. + { "rule_set": $rs }')
     fi
+    if [[ "$inb_len" -gt 0 ]]; then
+        rule_obj=$(echo "$rule_obj" | jq --argjson inb "$selected_inbounds" '. + { "inbound": $inb }')
+    fi
+
     jq --argjson r "$rule_obj" '.route.rules = [$r] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+
     apply_config
     echo -e "${GREEN}[成功] 已添加规则: [$domains] -> [$target_tag]${PLAIN}"
     sleep 1
-    echo -e "" 
+    echo -e ""
     route_menu
 }
 
@@ -2111,6 +2188,7 @@ mod_ss_menu() {
            read -p "请输入新端口: " p
            new_tag="Shadowsocks-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+           echo -e ""
            show_ss_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2660,8 +2738,13 @@ mod_vless_menu() {
            ;;
         5) 
            RANDOM=$(date +%s%N)
+           current_sni=$(jq -r ".inbounds[$idx].tls.server_name" $CONFIG_FILE)
            domains=("www.paypal.com" "www.prada.com" "www.loewe.com" "www.rolex.com" "www.cartier.com")
-           random_sni=${domains[$RANDOM % ${#domains[@]}]}
+           available=()
+           for d in "${domains[@]}"; do
+               [[ "$d" != "$current_sni" ]] && available+=("$d")
+           done
+           random_sni=${available[$RANDOM % ${#available[@]}]}
            read -p "SNI(回车随机生成): " sn
            if [[ -z "$sn" ]]; then sn="$random_sni"; fi
            jq --arg sn "$sn" --argjson i "$idx" '.inbounds[$i].tls.server_name = $sn | .inbounds[$i].tls.reality.handshake.server = $sn' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
@@ -2712,7 +2795,7 @@ show_vless_info() {
              echo -e "${GREEN}${msg}${PLAIN}"
              echo -e ""
         fi
-        show_vless_info_display "$server_ip" "$port" "$uuid" "$sni" "$pub" "$name" "$link"
+        show_vless_info_display "$server_ip" "$port" "$uuid" "$sni" "$pub" "$sid" "$name" "$link"
     fi
 }
 
@@ -2941,8 +3024,15 @@ del_config() {
 }
 
 show_traffic() {
-    echo -e "${CYAN}------------ 流量监控与限制 (Traffic Monitor) ------------${PLAIN}"
-    echo -e "--------------------------------------------------------------------------------------------------------------------"
+    local separator="--------------------------------------------------------------------------------------------------------------------"
+    local title=" 流量监控与限制 (Traffic Monitor) "
+    local sep_len=${#separator}
+    local title_vis=$(get_visual_length "$title")
+    local side=$(( (sep_len - title_vis) / 2 ))
+    local left_dashes=$(printf '%0.s-' $(seq 1 $side))
+    local right_dashes=$(printf '%0.s-' $(seq 1 $((sep_len - title_vis - side))))
+    echo -e "${CYAN}${left_dashes}${title}${right_dashes}${PLAIN}"
+    echo -e "$separator"
     count=$(jq '.inbounds | length' $CONFIG_FILE)
     if [[ "$count" -eq 0 ]]; then
         echo -e "${YELLOW}暂无节点${PLAIN}"
@@ -2979,11 +3069,10 @@ show_traffic() {
             v_len=$(get_visual_length "$tag")
             pad_len=$((30 - v_len))
             padding=$(get_padding "$pad_len")
-            
-            # 【UI修改】 在箭头前分别加了 出 和 入，并调整了对齐
+
             printf "${GREEN}%d.${PLAIN}    %s%s    ${PLAIN}出↑${PLAIN} %-12s    ${PLAIN}入↓${PLAIN} %-12s    ${PLAIN}总:${PLAIN} %-12s    %b\n" \
             "$((i+1))" "$tag" "$padding" "$tx_f" "$rx_f" "$total_f" "$status_text"
-            
+
             if [[ $i -lt $((count-1)) ]]; then echo -e ""; fi
         done
     fi
