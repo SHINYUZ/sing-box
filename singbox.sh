@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =========================================================
-# 脚本名称: Sing-box Script By Shinyuz (v1.9.4 - Auto Migration)
-# 版本: v1.9.4 (自动迁移旧config中的domain_strategy)
+# 脚本名称: Sing-box Script By Shinyuz (v1.9.5 - Bug Fixes)
+# 版本: v1.9.5 (修复 Bug 1-11 及相关问题)
 # =========================================================
 
 # --- 基础配置 ---
@@ -13,9 +13,10 @@ TG_CONF="$WORKDIR/tg_notify.conf"
 SB_BIN="$WORKDIR/sing-box"
 CADDY_BIN="/usr/bin/caddy"
 CADDY_FILE="/etc/caddy/Caddyfile"
+CADDY_SITES_DIR="/etc/caddy/sites"
 MONITOR_SERVICE="/etc/systemd/system/singbox-traffic.service"
 MONITOR_TIMER="/etc/systemd/system/singbox-traffic.timer"
-SCRIPT_VERSION="v1.9.4"
+SCRIPT_VERSION="v1.9.5"
 FROM_MODIFY=false
 NEED_RELOAD=false
 VIEW_ONLY=false
@@ -32,24 +33,96 @@ PLAIN='\e[0m'
 # 核心函数
 # =========================================================
 
+# [Bug2 Fix] 辅助函数：根据 inbound 的本地端口找到其对应的 Caddy site 文件
+find_caddy_site_by_port() {
+    local port=$1
+    [[ -z "$port" || ! -d "$CADDY_SITES_DIR" ]] && return 1
+    grep -rl "reverse_proxy 127.0.0.1:${port}" "$CADDY_SITES_DIR" 2>/dev/null | head -n 1
+}
+
+# [Bug2 Fix] 辅助函数：根据本地端口读出对应的 domain
+get_caddy_domain_by_port() {
+    local port=$1
+    local site_file
+    site_file=$(find_caddy_site_by_port "$port")
+    [[ -z "$site_file" ]] && return 1
+    local fname
+    fname=$(basename "$site_file" .caddy)
+    if [[ -n "$fname" ]]; then
+        echo "$fname"
+        return 0
+    fi
+    grep -oP '^[^ {]+(?= \{)' "$site_file" 2>/dev/null | head -n 1
+}
+
+# [Bug6 Fix] 辅助函数：按匹配模式循环删除 nft 规则（防止一次性把多条 handle 传给 nft delete 导致语法错误）
+sb_nft_del_all() {
+    local table=$1 chain=$2 pattern=$3
+    while nft -a list chain inet "$table" "$chain" 2>/dev/null | grep -qE "$pattern"; do
+        local h
+        h=$(nft -a list chain inet "$table" "$chain" 2>/dev/null | grep -E "$pattern" | head -n 1 | awk '{print $NF}')
+        [[ -z "$h" ]] && break
+        nft delete rule inet "$table" "$chain" handle "$h" 2>/dev/null || break
+    done
+}
+
+# [Bug8 Fix] 出口节点常用校验：端口、非空字段
+# 用法: is_valid_port "$port" && echo ok
+is_valid_port() {
+    local p=$1
+    [[ "$p" =~ ^[0-9]+$ ]] && [[ "$p" -ge 1 ]] && [[ "$p" -le 65535 ]]
+}
+
+# 出口添加流程通用校验入口：端口 + 必填非空
+# 用法: validate_outbound_basic "端口" "<可选必填字段1>" "<可选必填字段2>" ...
+# 校验失败时打印错误并返回 1
+validate_outbound_basic() {
+    local port=$1
+    shift
+    if ! is_valid_port "$port"; then
+        echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+        echo -e ""
+        return 1
+    fi
+    local f
+    for f in "$@"; do
+        if [[ -z "$f" ]]; then
+            echo -e "${RED}错误：必填字段不能为空${PLAIN}"
+            echo -e ""
+            return 1
+        fi
+    done
+    return 0
+}
+
+# [Graceful Restart] 计算 config.json 中"真正影响 sing-box 进程行为"的字段的语义指纹
+# 仅对 inbounds/outbounds/route/dns/endpoints/experimental/log/ntp 这些运行时相关字段做指纹
+# 改 tag 显示、修注释等不影响运行的改动会被忽略；通过 jq -S 规范化 key 顺序，消除无意义抖动
+_sb_runtime_fingerprint() {
+    [[ ! -f "$CONFIG_FILE" ]] && { echo ""; return; }
+    jq -S -c '{
+        inbounds:     (.inbounds     // []),
+        outbounds:    (.outbounds    // []),
+        route:        (.route        // {}),
+        dns:          (.dns          // {}),
+        endpoints:    (.endpoints    // []),
+        experimental: (.experimental // {}),
+        log:          (.log          // {}),
+        ntp:          (.ntp          // {})
+    }' "$CONFIG_FILE" 2>/dev/null | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+# 记录"当前正在运行的 sing-box 所对应的配置指纹"
+SB_FP_FILE="$WORKDIR/.running_fingerprint"
+
 apply_config() {
     if [[ "$VIEW_ONLY" == "true" ]]; then
         return 0
     fi
-    # 1. 检查配置语法
-    check_output=$($SB_BIN check -c $CONFIG_FILE 2>&1)
-    if [[ $? -eq 0 ]]; then
-        # 2. 尝试重载服务
-        if systemctl reload sing-box >/dev/null 2>&1; then
-            init_nftables  # 【新增】重载成功后立即刷新防火墙规则
-            return 0
-        else
-            systemctl restart sing-box
-            sleep 1
-            init_nftables  # 【新增】重启成功后立即刷新防火墙规则
-            return 0
-        fi
-    else
+    # [Bonus Fix] 先做静态校验
+    local check_output
+    check_output=$($SB_BIN check -c "$CONFIG_FILE" 2>&1)
+    if [[ $? -ne 0 ]]; then
         echo -e "${RED}配置文件校验失败！sing-box 可能无法启动。${PLAIN}"
         echo -e ""
         echo -e "${PLAIN}$check_output${PLAIN}"
@@ -60,6 +133,51 @@ apply_config() {
         menu
         return 1
     fi
+
+    # [Graceful Restart] 如果 config 的运行时部分没变 且 sing-box 还活着，就跳过 restart
+    # 这样可以保护所有"正在通过本机节点的 TCP 连接"（包括你的 SSH）不被误伤
+    local new_fp old_fp
+    new_fp=$(_sb_runtime_fingerprint)
+    old_fp=""
+    [[ -f "$SB_FP_FILE" ]] && old_fp=$(cat "$SB_FP_FILE" 2>/dev/null)
+
+    if [[ -n "$new_fp" && "$new_fp" == "$old_fp" ]] && systemctl is-active --quiet sing-box; then
+        # 配置无实质变化 且 sing-box 正在运行 —— 无需 restart
+        init_nftables
+        return 0
+    fi
+
+    # [Bonus Fix] sing-box 对 SIGHUP 的 reload 并不总是可靠（很多版本等于 no-op），
+    # 直接 restart 更稳妥，且需要在 restart 失败时立即暴露错误，而不是继续假装成功。
+    if ! systemctl restart sing-box; then
+        echo -e "${RED}sing-box 启动失败！${PLAIN}"
+        echo -e ""
+        journalctl -u sing-box -n 20 --no-pager
+        echo -e ""
+        read -n 1 -s -r -p "按任意键返回..."
+        echo -e ""
+        echo -e ""
+        menu
+        return 1
+    fi
+    sleep 1
+    if ! systemctl is-active --quiet sing-box; then
+        echo -e "${RED}sing-box 启动后立即退出，请查看日志：${PLAIN}"
+        echo -e ""
+        journalctl -u sing-box -n 30 --no-pager
+        echo -e ""
+        read -n 1 -s -r -p "按任意键返回..."
+        echo -e ""
+        echo -e ""
+        menu
+        return 1
+    fi
+
+    # [Graceful Restart] restart 成功后，记下这份配置的指纹，供下次比对
+    [[ -n "$new_fp" ]] && echo "$new_fp" > "$SB_FP_FILE"
+
+    init_nftables
+    return 0
 }
 
 check_root() {
@@ -274,7 +392,8 @@ EOF
     
     # --- 配置文件检查 ---
     if [[ ! -f "$CONFIG_FILE" ]] || ! jq . "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo "{ \"log\": { \"level\": \"info\" }, \"inbounds\": [], \"outbounds\": [{\"type\":\"direct\",\"tag\":\"direct\"},{\"type\":\"block\",\"tag\":\"block\"}], \"route\": {\"rules\": [], \"rule_set\": [], \"final\": \"direct\"} }" > $CONFIG_FILE
+        # [Bug10 Fix] sing-box v1.11+ 已弃用 type=block 出口，新规则用 action:reject 表示
+        echo "{ \"log\": { \"level\": \"info\" }, \"inbounds\": [], \"outbounds\": [{\"type\":\"direct\",\"tag\":\"direct\"}], \"route\": {\"rules\": [], \"rule_set\": [], \"final\": \"direct\"} }" > $CONFIG_FILE
     else
         if [[ $(jq '.route' $CONFIG_FILE) == "null" ]]; then
              jq '. + {"route": {"rules": [], "rule_set": [], "final": "direct"}}' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
@@ -282,18 +401,17 @@ EOF
         if [[ $(jq '.route.rule_set' $CONFIG_FILE) == "null" ]]; then
              jq '.route += {"rule_set": []}' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         fi
-        if [[ $(jq '[.outbounds[] | select(.tag == "block")] | length' $CONFIG_FILE) -eq 0 ]]; then
-             jq '.outbounds += [{"type":"block","tag":"block"}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        # [Bug10 Fix] 自动把已有 rules 里 outbound==block 的项改成 action:reject，并删除 block 出口
+        if jq -e '[.route.rules[]? | select(.outbound == "block")] | length > 0' $CONFIG_FILE >/dev/null 2>&1; then
+            jq '.route.rules |= map(if .outbound == "block" then (. + {"action":"reject"} | del(.outbound)) else . end)' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+        fi
+        if [[ $(jq '[.outbounds[] | select(.tag == "block" or .type == "block")] | length' $CONFIG_FILE) -gt 0 ]]; then
+            jq '.outbounds = [.outbounds[] | select(.tag != "block" and .type != "block")]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
         fi
     fi
     
-    # [Bug1 Fix] 自动迁移已有 config.json 中残留的旧 domain_strategy 字段
+    # [Bug7 Fix] 自动迁移已有 config.json 中残留的旧 domain_strategy 字段到 domain_resolver（只保留一次）
     if jq -e '[.outbounds[] | select(.domain_strategy != null)] | length > 0' $CONFIG_FILE >/dev/null 2>&1; then
-        jq '(.outbounds[] | select(.domain_strategy != null)) |= (. + {"domain_resolver": {"server": "local-dns", "strategy": .domain_strategy}} | del(.domain_strategy))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-    fi
-
-    # [Bug1 Fix] 自动迁移已有 outbound 中的旧 domain_strategy 字段到 domain_resolver
-    if [[ $(jq '[.outbounds[] | select(.domain_strategy != null)] | length' $CONFIG_FILE) -gt 0 ]]; then
         jq '(.outbounds[] | select(.domain_strategy != null)) |= (. + {"domain_resolver": {"server": "local-dns", "strategy": .domain_strategy}} | del(.domain_strategy))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     fi
 
@@ -490,13 +608,16 @@ get_padding() {
 }
 
 ensure_monitor_timer() {
+    # [Bug11 Fix] 使用 BASH_SOURCE 而非 $0，避免通过 /usr/bin/sb 软链调用时解析异常
+    local self_path
+    self_path=$(readlink -f "${BASH_SOURCE[0]}")
     cat > "$MONITOR_SERVICE" <<EOF
 [Unit]
 Description=Singbox Traffic Monitor
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash $(readlink -f $0) monitor
+ExecStart=/bin/bash ${self_path} monitor
 EOF
 
     cat > "$MONITOR_TIMER" <<EOF
@@ -525,6 +646,106 @@ check_tag_exists() {
     else
         return 1 
     fi
+}
+
+rename_inbound_in_rules() {
+    local old_tag=$1
+    local new_tag=$2
+    [[ -z "$old_tag" || -z "$new_tag" || "$old_tag" == "$new_tag" ]] && return 0
+    jq --arg old "$old_tag" --arg new "$new_tag" '
+        .route.rules |= map(
+            if has("inbound") then
+                .inbound |= map(if . == $old then $new else . end)
+            else . end
+        )' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+}
+
+# [Bug1 Fix] 检查端口是否已被现有 inbound 占用
+check_port_exists() {
+    local p=$1
+    [[ -z "$p" || ! "$p" =~ ^[0-9]+$ ]] && return 1
+    local exists=$(jq --argjson p "$p" '[.inbounds[].listen_port] | index($p)' $CONFIG_FILE 2>/dev/null)
+    if [[ "$exists" != "null" && -n "$exists" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# [Bug3 Fix] 迁移端口相关的限额/限速/nftables/cron/tc 资源（改端口时用）
+migrate_port_resources() {
+    local old_port=$1
+    local new_port=$2
+    [[ -z "$old_port" || -z "$new_port" || "$old_port" == "$new_port" ]] && return 0
+
+    # 1. 迁移流量限额/限速配置文件
+    [[ -f "$WORKDIR/limit_${old_port}.conf" ]] && mv "$WORKDIR/limit_${old_port}.conf" "$WORKDIR/limit_${new_port}.conf"
+    [[ -f "$WORKDIR/limit_rate_${old_port}.conf" ]] && mv "$WORKDIR/limit_rate_${old_port}.conf" "$WORKDIR/limit_rate_${new_port}.conf"
+
+    # 2. 清理旧端口的 nftables 计数器（新端口会在 init_nftables 时自动补上）
+    if nft list table inet singbox_stats >/dev/null 2>&1; then
+        while nft -a list chain inet singbox_stats input_counter 2>/dev/null | grep -qE "dport $old_port"; do
+            local h=$(nft -a list chain inet singbox_stats input_counter 2>/dev/null | grep -E "dport $old_port" | head -n 1 | awk '{print $NF}')
+            [[ -z "$h" ]] && break
+            nft delete rule inet singbox_stats input_counter handle $h 2>/dev/null || break
+        done
+        while nft -a list chain inet singbox_stats output_counter 2>/dev/null | grep -qE "sport $old_port"; do
+            local h=$(nft -a list chain inet singbox_stats output_counter 2>/dev/null | grep -E "sport $old_port" | head -n 1 | awk '{print $NF}')
+            [[ -z "$h" ]] && break
+            nft delete rule inet singbox_stats output_counter handle $h 2>/dev/null || break
+        done
+    fi
+
+    # 3. 清理旧端口的 sb_block 封禁规则
+    if nft list table inet sb_block >/dev/null 2>&1; then
+        while nft -a list chain inet sb_block input 2>/dev/null | grep -qE "dport $old_port drop"; do
+            local h=$(nft -a list chain inet sb_block input 2>/dev/null | grep -E "dport $old_port drop" | head -n 1 | awk '{print $NF}')
+            [[ -z "$h" ]] && break
+            nft delete rule inet sb_block input handle $h 2>/dev/null || break
+        done
+    fi
+
+    # 4. 迁移 cron 自动重置任务（把老端口引用替换为新端口）
+    if command -v crontab &> /dev/null; then
+        crontab -l 2>/dev/null | sed "s|reset_port_exec $old_port |reset_port_exec $new_port |g; s|# reset_${old_port}$|# reset_${new_port}|g" | crontab - 2>/dev/null
+    fi
+
+    # 5. 清理 tc 限速（新端口下次用户自己重新设置）
+    local dev=$(ip route 2>/dev/null | grep default | head -n1 | awk '{print $5}')
+    if [[ -n "$dev" ]]; then
+        tc filter del dev $dev parent 1:0 protocol ip prio 1 u32 match ip sport $old_port 0xffff >/dev/null 2>&1
+        tc class del dev $dev parent 1:1 classid 1:$(printf "%x" $old_port) >/dev/null 2>&1
+    fi
+}
+
+# [Bug3 Fix] 改端口前的通用校验：验证端口格式 + 冲突检查
+# 用法: validate_new_port "新端口" "当前端口"
+# 返回 0 表示校验通过，返回 1 表示校验失败（已打印错误信息）
+validate_new_port() {
+    local new_p=$1
+    local cur_p=$2
+    if [[ ! "$new_p" =~ ^[0-9]+$ ]] || [[ "$new_p" -lt 1 ]] || [[ "$new_p" -gt 65535 ]]; then
+        echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+        return 1
+    fi
+    if [[ "$new_p" != "$cur_p" ]] && check_port_exists "$new_p"; then
+        echo -e "${RED}错误：端口 $new_p 已被其他节点占用${PLAIN}"
+        return 1
+    fi
+    return 0
+}
+
+# [Bug5 Fix] 改备注前的通用校验：检查新 tag 是否与其他节点冲突
+# 用法: validate_new_tag "新tag" "旧tag"
+# 返回 0 通过，1 失败
+validate_new_tag() {
+    local new_t=$1
+    local old_t=$2
+    if [[ "$new_t" != "$old_t" ]] && check_tag_exists "$new_t"; then
+        echo -e "${RED}错误：备注 '$new_t' 已存在${PLAIN}"
+        return 1
+    fi
+    return 0
 }
 
 update_sb_core() {
@@ -797,9 +1018,24 @@ add_ss() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(回车随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(回车随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     echo -e ""
     while true; do
@@ -896,9 +1132,24 @@ add_vless() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(回车随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(回车随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     while true; do
         echo -e ""
@@ -973,20 +1224,64 @@ show_vless_info_display() {
 add_vless_ws_tls() {
     echo -e "${CYAN}>>> 配置 VLESS-WS-TLS${PLAIN}"
     echo -e ""
-    read -p "请输入域名: " domain
-    echo -e ""
+    while true; do
+        read -p "请输入域名: " domain
+        echo -e ""
+        if [[ -z "$domain" ]]; then
+            echo -e "${RED}错误：域名不能为空${PLAIN}"
+            echo -e ""
+            continue
+        fi
+        # [Bug3 Fix] 同一域名不允许重复添加
+        if [[ -f "$CADDY_SITES_DIR/${domain}.caddy" ]]; then
+            echo -e "${RED}错误：域名 '$domain' 已被添加过，请换一个${PLAIN}"
+            echo -e ""
+            continue
+        fi
+        break
+    done
     install_caddy
+    # [Bug3 Fix] 确保随机生成的内部端口不冲突
     local_port=$(get_random_port)
+    while check_port_exists "$local_port"; do
+        local_port=$(get_random_port)
+    done
     uuid=$($SB_BIN generate uuid)
     rand_str=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 40)
     ws_path="/${rand_str}"
-    name="VLESS-WS-TLS-443"
+
+    # [Bug3 Fix] 不再硬编码 tag，允许自定义并校验唯一
+    while true; do
+        read -p "请输入备注(回车默认 VLESS-WS-TLS-<域名>): " input_name
+        echo -e ""
+        if [[ -z "$input_name" ]]; then
+            name="VLESS-WS-TLS-${domain}"
+        else
+            name="${input_name}-${domain}"
+        fi
+        if check_tag_exists "$name"; then
+            echo -e "${RED}错误：备注 '$name' 已存在，请换一个名字。${PLAIN}"
+            echo -e ""
+        else
+            break
+        fi
+    done
+
     jq --argjson p "$local_port" --arg u "$uuid" --arg n "$name" --arg path "$ws_path" \
         '.inbounds += [{"type":"vless","tag":$n,"listen":"127.0.0.1","listen_port":$p,"users":[{"uuid":$u,"name":$n}],"transport":{"type":"ws","path":$path}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-    mkdir -p /etc/caddy
-    echo "$domain {
+
+    # [Bug2 Fix] 每个域名写成独立的 site 文件，由主 Caddyfile import，避免覆盖已有配置
+    mkdir -p "$CADDY_SITES_DIR"
+    cat > "$CADDY_SITES_DIR/${domain}.caddy" <<EOF
+$domain {
     reverse_proxy 127.0.0.1:$local_port
-}" > "$CADDY_FILE"
+}
+EOF
+    # 确保主 Caddyfile 里有 import 指令
+    mkdir -p /etc/caddy
+    if [[ ! -f "$CADDY_FILE" ]] || ! grep -q "import ${CADDY_SITES_DIR}/" "$CADDY_FILE" 2>/dev/null; then
+        echo "import ${CADDY_SITES_DIR}/*.caddy" > "$CADDY_FILE"
+    fi
     systemctl restart caddy >/dev/null 2>&1
     link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&sni=${domain}&fp=chrome&path=${ws_path}#${name}"
     if apply_config; then
@@ -1038,9 +1333,24 @@ add_hy2() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(默认随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(默认随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     while true; do
         echo -e ""
@@ -1098,9 +1408,24 @@ add_tuic() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(默认随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(默认随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     while true; do
         echo -e ""
@@ -1181,9 +1506,24 @@ add_trojan() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(默认随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(默认随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     while true; do
         echo -e ""
@@ -1269,9 +1609,24 @@ add_anytls() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(默认随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(默认随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     while true; do
         echo -e ""
@@ -1357,9 +1712,24 @@ add_socks() {
     server_ip=$(curl -s4 ipv4.icanhazip.com)
     if [[ -z "$server_ip" ]]; then server_ip="你的服务器IP"; fi
     echo -e ""
-    read -p "请输入端口(回车随机): " port
-    echo -e ""
-    if [[ -z "$port" ]]; then port=$(get_random_port); fi
+    while true; do
+        read -p "请输入端口(回车随机): " port
+        echo -e ""
+        if [[ -z "$port" ]]; then port=$(get_random_port); fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+            echo -e "${RED}错误：端口必须是 1-65535 之间的数字${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        if check_port_exists "$port"; then
+            echo -e "${RED}错误：端口 $port 已被其他节点占用，请换一个${PLAIN}"
+            echo -e ""
+            port=""
+            continue
+        fi
+        break
+    done
     echo -e "${GREEN}使用端口: $port${PLAIN}"
     while true; do
         echo -e ""
@@ -1499,6 +1869,12 @@ add_outbound_ss() {
     echo -e ""
     read -p "请输入密码: " pwd
     echo -e ""
+    # [Bug8 Fix] 端口/必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$pwd"; then
+        sleep 1
+        route_menu
+        return
+    fi
     while true; do
         echo -e "请选择加密方式:"
         echo -e ""
@@ -1530,8 +1906,9 @@ add_outbound_ss() {
             5) method="2022-blake3-aes-128-gcm"; break ;;
             6) method="2022-blake3-aes-256-gcm"; break ;;
             7) method="2022-blake3-chacha20-poly1305"; break ;;
+            *) echo -e "${RED}无效选择${PLAIN}"; echo -e ""; continue ;;
         esac
-        break
+        # [Bug4 Fix] 只有 case 命中有效分支后才会 break，无效输入会 continue 回到开头
     done
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg m "$method" --arg pwd "$pwd" \
         '.outbounds += [{"type":"shadowsocks","tag":$t,"server":$s,"server_port":$p,"method":$m,"password":$pwd}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
@@ -1566,6 +1943,12 @@ add_outbound_vless() {
     echo -e ""
     read -p "请输入Short ID (可选,回车跳过不填写): " sid
     echo -e ""
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$uuid" "$sni" "$pk"; then
+        sleep 1
+        route_menu
+        return
+    fi
     if [[ -n "$sid" ]]; then
         jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
             '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":$sn,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":$pk,"short_id":$sid}}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
@@ -1604,6 +1987,12 @@ add_outbound_vless_ws() {
     echo -e ""
     read -p "请输入SNI (TLS ServerName): " sni
     echo -e ""
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$uuid" "$sni"; then
+        sleep 1
+        route_menu
+        return
+    fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg path "$path" --arg sni "$sni" \
         '.outbounds += [{"type":"vless","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"tls":{"enabled":true,"server_name":$sni,"insecure":false},"transport":{"type":"ws","path":$path}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
@@ -1633,6 +2022,12 @@ add_outbound_hy2() {
     echo -e ""
     read -p "请输入SNI: " sni
     echo -e ""
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$pwd" "$sni"; then
+        sleep 1
+        route_menu
+        return
+    fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sn "$sni" \
         '.outbounds += [{"type":"hysteria2","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn,"insecure":true}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
@@ -1664,6 +2059,12 @@ add_outbound_tuic() {
     echo -e ""
     read -p "请输入SNI: " sni
     echo -e ""
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$uuid" "$pwd" "$sni"; then
+        sleep 1
+        route_menu
+        return
+    fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg u "$uuid" --arg pwd "$pwd" --arg sni "$sni" \
         '.outbounds += [{"type":"tuic","tag":$t,"server":$s,"server_port":$p,"uuid":$u,"password":$pwd,"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
@@ -1694,6 +2095,12 @@ add_outbound_trojan() {
     read -p "请输入SNI: " sni
     echo -e ""
     if [[ -z "$sni" ]]; then echo -e "${RED}SNI不能为空${PLAIN}"; route_menu; return; fi
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$pwd"; then
+        sleep 1
+        route_menu
+        return
+    fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sni "$sni" \
         '.outbounds += [{"type":"trojan","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
@@ -1724,6 +2131,12 @@ add_outbound_anytls() {
     read -p "请输入SNI: " sni
     echo -e ""
     if [[ -z "$sni" ]]; then echo -e "${RED}SNI不能为空${PLAIN}"; route_menu; return; fi
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$pwd"; then
+        sleep 1
+        route_menu
+        return
+    fi
     jq --arg t "$tag" --arg s "$addr" --argjson p "$port" --arg pwd "$pwd" --arg sn "$sni" \
         '.outbounds += [{"type":"anytls","tag":$t,"server":$s,"server_port":$p,"password":$pwd,"tls":{"enabled":true,"server_name":$sn,"insecure":true}}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
@@ -1753,6 +2166,12 @@ add_outbound_socks() {
     echo -e ""
     read -p "请输入密码: " p
     echo -e ""
+    # [Bug8 Fix] 端口和必填字段校验
+    if ! validate_outbound_basic "$port" "$addr" "$u" "$p"; then
+        sleep 1
+        route_menu
+        return
+    fi
     jq --arg t "$tag" --arg s "$addr" --argjson port "$port" --arg u "$u" --arg p "$p" \
         '.outbounds += [{"type":"socks","tag":$t,"server":$s,"server_port":$port,"username":$u,"password":$p}]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     apply_config
@@ -1763,7 +2182,8 @@ add_outbound_socks() {
 }
 
 block_cn_manager() {
-    is_blocked=$(jq '.route.rules[]? | select(.outbound == "block" and ((.rule_set | index("geoip-cn") != null) or (.rule_set | index("geosite-cn") != null)))' $CONFIG_FILE 2>/dev/null)
+    # [Bug10+Bonus13 Fix] 使用 action:"reject" 代替已废弃的 outbound:"block"，并避免 rule_set 为 null 时 index() 报错
+    is_blocked=$(jq '.route.rules[]? | select(((.outbound // "") == "block" or (.action // "") == "reject") and ((((.rule_set) // []) | index("geoip-cn") != null) or (((.rule_set) // []) | index("geosite-cn") != null)))' $CONFIG_FILE 2>/dev/null)
 
     echo -e "${CYAN}>>> 屏蔽/恢复 大陆管理${PLAIN}"
     echo -e ""
@@ -1774,7 +2194,7 @@ block_cn_manager() {
         read -p "是否恢复大陆流量? (y/n): " c
         
         if [[ "$c" == "y" ]]; then
-            jq 'del(.route.rules[] | select(.outbound == "block" and ((.rule_set | index("geoip-cn") != null) or (.rule_set | index("geosite-cn") != null))))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+            jq 'del(.route.rules[] | select(((.outbound // "") == "block" or (.action // "") == "reject") and ((((.rule_set) // []) | index("geoip-cn") != null) or (((.rule_set) // []) | index("geosite-cn") != null))))' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             # 【Bug修复】清理不再被任何规则引用的孤立 rule_set 条目（含 geoip-cn / geosite-cn）
             jq '([ .route.rules[]?.rule_set? // [] ] | add // []) as $used | .route.rule_set = [ .route.rule_set[]? | select( .tag as $t | ($used | index($t)) != null ) ]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             apply_config
@@ -1816,7 +2236,7 @@ block_cn_manager() {
                    $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             fi
 
-            jq '.route.rules = [{"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"}] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+            jq '.route.rules = [{"rule_set": ["geoip-cn", "geosite-cn"], "action": "reject"}] + .route.rules' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
             
             apply_config
             
@@ -1849,7 +2269,7 @@ view_del_route() {
         echo -e ""
     else
         for ((i=0; i<$rcount; i++)); do
-            out=$(jq -r ".route.rules[$i].outbound" $CONFIG_FILE)
+            out=$(jq -r ".route.rules[$i].outbound // .route.rules[$i].action // \"\"" $CONFIG_FILE)
             dom=$(jq -r ".route.rules[$i].domain // [] | join(\", \")" $CONFIG_FILE)
             rs=$(jq -r ".route.rules[$i].rule_set // [] | join(\", \")" $CONFIG_FILE)
             inb=$(jq -r ".route.rules[$i].inbound // [] | join(\", \")" $CONFIG_FILE)
@@ -2143,9 +2563,27 @@ modify_config() {
 
 change_protocol_logic() {
     local idx=$1
-    echo -e "${YELLOW}更改协议需要重置此节点配置...${PLAIN}"
-    echo -e "" 
+    local tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+    # [Bug6 Fix] 改协议会删除原节点，先要求用户确认，避免误删
+    echo -e "${YELLOW}警告：更改协议会删除原节点 '${tag}' 的所有配置，无法恢复${PLAIN}"
+    echo -e ""
+    read -p "确认继续? (y/n): " confirm
+    echo -e ""
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${YELLOW}已取消${PLAIN}"
+        sleep 1
+        modify_config
+        return
+    fi
+    local old_tag="$tag"
     jq "del(.inbounds[$idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+    jq --arg t "$old_tag" '
+        .route.rules = [.route.rules[] |
+            if has("inbound") then
+                (.inbound |= map(select(. != $t))) |
+                select(.inbound | length > 0)
+            else . end
+        ]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
     FROM_MODIFY=true
     add_config
 }
@@ -2186,9 +2624,18 @@ mod_ss_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "请输入新端口: " p
+           echo -e ""
+           old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+           old_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_ss_menu "$idx"
+               return
+           fi
            new_tag="Shadowsocks-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_ss_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2236,7 +2683,7 @@ mod_ss_menu() {
                    2) m="aes-256-gcm";; 
                    3) m="chacha20-ietf-poly1305";; 
                    4) m="xchacha20-ietf-poly1305";; 
-                   5) m="2022-blake3-aes-128-gcm"; need_key=true; k_len=32;; 
+                   5) m="2022-blake3-aes-128-gcm"; need_key=true; k_len=16;; 
                    6) m="2022-blake3-aes-256-gcm"; need_key=true; k_len=32;; 
                    7) m="2022-blake3-chacha20-poly1305"; need_key=true; k_len=32;; 
                    *) continue;; 
@@ -2257,8 +2704,15 @@ mod_ss_menu() {
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-${port}"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_ss_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
                show_ss_info "$idx" "备注已更新"
            else
@@ -2327,9 +2781,18 @@ mod_hy2_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "请输入新端口: " p
+           echo -e ""
+           old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+           old_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_hy2_menu "$idx"
+               return
+           fi
            new_tag="Hysteria2-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_hy2_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2343,10 +2806,17 @@ mod_hy2_menu() {
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-${port}"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_hy2_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
-               show_hy2_info "$idx" "备注已更新"
+               show_hy2_info "$idx" "备注已更新"	
            else
                mod_hy2_menu "$idx"
            fi 
@@ -2396,9 +2866,18 @@ mod_tuic_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "请输入新端口: " p
+           echo -e ""
+           old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+           old_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_tuic_menu "$idx"
+               return
+           fi
            new_tag="Tuic-V5-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_tuic_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2419,8 +2898,15 @@ mod_tuic_menu() {
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-${port}"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_tuic_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
                show_tuic_info "$idx" "备注已更新"
            else
@@ -2455,9 +2941,18 @@ mod_trojan_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "请输入新端口: " p
+           echo -e ""
+           old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+           old_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_trojan_menu "$idx"
+               return
+           fi
            new_tag="Trojan-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_trojan_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2470,8 +2965,15 @@ mod_trojan_menu() {
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-${port}"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_trojan_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
                show_trojan_info "$idx" "备注已更新"
            else
@@ -2519,9 +3021,18 @@ mod_anytls_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "请输入新端口: " p
+           echo -e ""
+           old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+           old_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_anytls_menu "$idx"
+               return
+           fi
            new_tag="AnyTLS-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_anytls_info "$idx" "端口及备注已更新" 
            ;;
         3) 
@@ -2535,8 +3046,15 @@ mod_anytls_menu() {
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-${port}"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_anytls_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
                show_anytls_info "$idx" "备注已更新"
            else
@@ -2586,9 +3104,18 @@ mod_vless_ws_menu() {
            read -p "请输入新域名: " d
            if [[ -n "$d" ]]; then
                local_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
-               echo "$d {
+               # [Bug2 Fix] 只更新/替换当前节点对应的 site 文件，不动其它域名
+               mkdir -p "$CADDY_SITES_DIR"
+               old_site=$(find_caddy_site_by_port "$local_port")
+               [[ -n "$old_site" && -f "$old_site" ]] && rm -f "$old_site"
+               cat > "$CADDY_SITES_DIR/${d}.caddy" <<EOF
+$d {
     reverse_proxy 127.0.0.1:$local_port
-}" > "$CADDY_FILE"
+}
+EOF
+               if [[ ! -f "$CADDY_FILE" ]] || ! grep -q "import ${CADDY_SITES_DIR}/" "$CADDY_FILE" 2>/dev/null; then
+                   echo "import ${CADDY_SITES_DIR}/*.caddy" > "$CADDY_FILE"
+               fi
                systemctl restart caddy
                echo -e ""
                show_vless_ws_info "$idx" "域名已更新" 
@@ -2614,8 +3141,15 @@ mod_vless_ws_menu() {
         5) 
            read -p "请输入新备注: " p
            if [[ -n "$p" ]]; then
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-443"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_vless_ws_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
                show_vless_ws_info "$idx" "备注已更新"
            else
@@ -2631,7 +3165,12 @@ show_vless_ws_info() {
     local idx=$1
     local msg=$2
     if apply_config; then
-        domain=$(grep -oP '(?<=^)[^ {]+(?= \{)' /etc/caddy/Caddyfile 2>/dev/null | head -n 1)
+        local_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+        # [Bug2 Fix] 按端口定位对应的 site 文件，避免多域名场景下拿错 domain
+        domain=$(get_caddy_domain_by_port "$local_port")
+        if [[ -z "$domain" ]]; then
+            domain=$(grep -oP '(?<=^)[^ {]+(?= \{)' "$CADDY_FILE" 2>/dev/null | head -n 1)
+        fi
         uuid=$(jq -r ".inbounds[$idx].users[0].uuid" $CONFIG_FILE)
         path=$(jq -r ".inbounds[$idx].transport.path" $CONFIG_FILE)
         name=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
@@ -2709,11 +3248,19 @@ mod_vless_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "请输入新端口: " p
+           echo -e ""
            old_tag=$(jq -r --argjson i "$idx" '.inbounds[$i].tag' $CONFIG_FILE)
+           old_port=$(jq -r --argjson i "$idx" '.inbounds[$i].listen_port' $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_vless_menu "$idx"
+               return
+           fi
            new_tag="VLESS-REALITY-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
            if [[ -f "$PK_FILE" ]]; then sed -i "s/^${old_tag}:/${new_tag}:/" $PK_FILE; fi
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_vless_info "$idx" "端口更新" 
            ;;
         3) 
@@ -2757,8 +3304,14 @@ mod_vless_menu() {
                current=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
                old=$(jq -r --argjson i "$idx" '.inbounds[$i].tag' $CONFIG_FILE)
                t="${p}-${current}"
+               if ! validate_new_tag "$t" "$old"; then
+                   sleep 1
+                   mod_vless_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
                if [[ -f "$PK_FILE" ]]; then sed -i "s/^${old}:/${t}:/" $PK_FILE; fi
+               rename_inbound_in_rules "$old" "$t"
                echo -e ""
                show_vless_info "$idx" "备注已更新"
            else
@@ -2822,9 +3375,18 @@ mod_socks_menu() {
         1) change_protocol_logic "$idx" ;;
         2) 
            read -p "新端口: " p
+           echo -e ""
+           old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
+           old_port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+           if ! validate_new_port "$p" "$old_port"; then
+               sleep 1
+               mod_socks_menu "$idx"
+               return
+           fi
            new_tag="Socks5-${p}"
            jq --argjson p "$p" --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].listen_port = $p | .inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
-           echo -e ""
+           rename_inbound_in_rules "$old_tag" "$new_tag"
+           migrate_port_resources "$old_port" "$p"
            show_socks_info "$idx" "端口更新" 
            ;;
         3) 
@@ -2843,8 +3405,15 @@ mod_socks_menu() {
            read -p "新备注: " p
            if [[ -n "$p" ]]; then
                port=$(jq -r ".inbounds[$idx].listen_port" $CONFIG_FILE)
+               old_tag=$(jq -r ".inbounds[$idx].tag" $CONFIG_FILE)
                t="${p}-${port}"
+               if ! validate_new_tag "$t" "$old_tag"; then
+                   sleep 1
+                   mod_socks_menu "$idx"
+                   return
+               fi
                jq --arg t "$t" --argjson i "$idx" '.inbounds[$i].tag = $t' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+               rename_inbound_in_rules "$old_tag" "$t"
                echo -e ""
                show_socks_info "$idx" "备注更新"
            else
@@ -2911,7 +3480,11 @@ view_config() {
              is_ws=$(jq -r ".inbounds[$real_idx].transport.type // empty" $CONFIG_FILE)
              is_reality=$(jq -r ".inbounds[$real_idx].tls.reality.enabled // false" $CONFIG_FILE)
              if [[ "$is_ws" == "ws" ]]; then
-                 domain=$(grep -oP '(?<=^)[^ {]+(?= \{)' /etc/caddy/Caddyfile 2>/dev/null | head -n 1)
+                 local_port=$(jq -r ".inbounds[$real_idx].listen_port" $CONFIG_FILE)
+                 domain=$(get_caddy_domain_by_port "$local_port")
+                 if [[ -z "$domain" ]]; then
+                     domain=$(grep -oP '(?<=^)[^ {]+(?= \{)' "$CADDY_FILE" 2>/dev/null | head -n 1)
+                 fi
                  uuid=$(jq -r ".inbounds[$real_idx].users[0].uuid" $CONFIG_FILE)
                  path=$(jq -r ".inbounds[$real_idx].transport.path" $CONFIG_FILE)
                  name=$(jq -r ".inbounds[$real_idx].tag" $CONFIG_FILE)
@@ -3005,12 +3578,93 @@ del_config() {
     echo -e ""
     
     if [[ "$opt" == "1" ]]; then
+        # [Bug2 Fix] 先记录所有要清理的信息（删除 inbound 前）
+        del_tag=$(jq -r ".inbounds[$real_idx].tag" $CONFIG_FILE)
+        del_port=$(jq -r ".inbounds[$real_idx].listen_port" $CONFIG_FILE)
+        del_type=$(jq -r ".inbounds[$real_idx].type" $CONFIG_FILE)
+        del_cert=$(jq -r ".inbounds[$real_idx].tls.certificate_path // empty" $CONFIG_FILE)
+        del_key=$(jq -r ".inbounds[$real_idx].tls.key_path // empty" $CONFIG_FILE)
+        del_transport=$(jq -r ".inbounds[$real_idx].transport.type // empty" $CONFIG_FILE)
+
+        # 1. 删除 inbound
         jq "del(.inbounds[$real_idx])" $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+
+        # 2. 清理 route.rules 里对该 tag 的引用
+        jq --arg t "$del_tag" '
+            .route.rules = [.route.rules[] |
+                if has("inbound") then
+                    (.inbound |= map(select(. != $t))) |
+                    select(.inbound | length > 0)
+                else . end
+            ]' $CONFIG_FILE > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" $CONFIG_FILE
+
+        # 3. 清理流量限额/限速配置文件
+        rm -f "$WORKDIR/limit_${del_port}.conf"
+        rm -f "$WORKDIR/limit_rate_${del_port}.conf"
+
+        # 4. 清理 nftables 计数器规则
+        if nft list table inet singbox_stats >/dev/null 2>&1; then
+            while nft -a list chain inet singbox_stats input_counter 2>/dev/null | grep -qE "dport $del_port"; do
+                h=$(nft -a list chain inet singbox_stats input_counter 2>/dev/null | grep -E "dport $del_port" | head -n 1 | awk '{print $NF}')
+                [[ -z "$h" ]] && break
+                nft delete rule inet singbox_stats input_counter handle $h 2>/dev/null || break
+            done
+            while nft -a list chain inet singbox_stats output_counter 2>/dev/null | grep -qE "sport $del_port"; do
+                h=$(nft -a list chain inet singbox_stats output_counter 2>/dev/null | grep -E "sport $del_port" | head -n 1 | awk '{print $NF}')
+                [[ -z "$h" ]] && break
+                nft delete rule inet singbox_stats output_counter handle $h 2>/dev/null || break
+            done
+        fi
+
+        # 5. 清理 sb_block 封禁规则
+        if nft list table inet sb_block >/dev/null 2>&1; then
+            while nft -a list chain inet sb_block input 2>/dev/null | grep -qE "dport $del_port drop"; do
+                h=$(nft -a list chain inet sb_block input 2>/dev/null | grep -E "dport $del_port drop" | head -n 1 | awk '{print $NF}')
+                [[ -z "$h" ]] && break
+                nft delete rule inet sb_block input handle $h 2>/dev/null || break
+            done
+        fi
+
+        # 6. 清理 cron 自动重置任务
+        if command -v crontab &> /dev/null; then
+            (crontab -l 2>/dev/null | grep -v "# reset_${del_port}$") | crontab - 2>/dev/null
+        fi
+
+        # 7. 清理 tc 限速规则
+        dev=$(ip route 2>/dev/null | grep default | head -n1 | awk '{print $5}')
+        if [[ -n "$dev" ]]; then
+            tc filter del dev $dev parent 1:0 protocol ip prio 1 u32 match ip sport $del_port 0xffff >/dev/null 2>&1
+            tc class del dev $dev parent 1:1 classid 1:$(printf "%x" $del_port) >/dev/null 2>&1
+        fi
+
+        # 8. 清理证书文件
+        [[ -n "$del_cert" && -f "$del_cert" ]] && rm -f "$del_cert"
+        [[ -n "$del_key" && -f "$del_key" ]] && rm -f "$del_key"
+
+        # 9. 清理 VLESS-REALITY 公钥记录
+        if [[ "$del_type" == "vless" && -f "$PK_FILE" ]]; then
+            sed -i "/^${del_tag}:/d" "$PK_FILE"
+        fi
+
+        # 10. 如果是 VLESS-WS-TLS，只清理该节点对应的 site 文件
+        if [[ "$del_transport" == "ws" ]]; then
+            old_site=$(find_caddy_site_by_port "$del_port")
+            if [[ -n "$old_site" && -f "$old_site" ]]; then
+                rm -f "$old_site"
+            fi
+            # 只有当没有任何 site 文件剩余时才重启（否则 reload 就够）
+            if ls "$CADDY_SITES_DIR"/*.caddy >/dev/null 2>&1; then
+                systemctl reload caddy >/dev/null 2>&1 || systemctl restart caddy >/dev/null 2>&1
+            else
+                systemctl restart caddy >/dev/null 2>&1
+            fi
+        fi
+
         apply_config
-        
+
         echo -e "${GREEN}已删除${PLAIN}"
         echo -e ""
-        
+
         read -n 1 -s -r -p "按任意键返回..."
         echo -e "" 
         echo -e "" # 下方空一行
@@ -3345,12 +3999,13 @@ reset_traffic_menu() {
     if [[ "$op" == "0" ]]; then reset_traffic_menu; return; fi
     if [[ "$op" == "1" ]]; then
         ensure_block_chain
-        nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet singbox_stats input_counter handle $(nft -a list chain inet singbox_stats input_counter | grep "tcp dport $port" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet singbox_stats output_counter handle $(nft -a list chain inet singbox_stats output_counter | grep "tcp sport $port" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet singbox_stats input_counter handle $(nft -a list chain inet singbox_stats input_counter | grep "udp dport $port" | awk '{print $NF}') 2>/dev/null
-        nft delete rule inet singbox_stats output_counter handle $(nft -a list chain inet singbox_stats output_counter | grep "udp sport $port" | awk '{print $NF}') 2>/dev/null
+        # [Bug6 Fix] 循环按单个 handle 删除，避免一次性传多个 handle
+        sb_nft_del_all sb_block       input          "tcp dport $port drop"
+        sb_nft_del_all sb_block       input          "udp dport $port drop"
+        sb_nft_del_all singbox_stats  input_counter  "tcp dport $port"
+        sb_nft_del_all singbox_stats  output_counter "tcp sport $port"
+        sb_nft_del_all singbox_stats  input_counter  "udp dport $port"
+        sb_nft_del_all singbox_stats  output_counter "udp sport $port"
         nft add rule inet singbox_stats input_counter tcp dport $port counter
         nft add rule inet singbox_stats output_counter tcp sport $port counter
         nft add rule inet singbox_stats input_counter udp dport $port counter
@@ -3366,7 +4021,9 @@ reset_traffic_menu() {
         echo -e ""
         (crontab -l 2>/dev/null | grep -v "# reset_${port}") | crontab -
         if [[ "$d" != "0" ]]; then
-            (crontab -l 2>/dev/null; echo "0 0 $d * * /bin/bash $(readlink -f $0) reset_port_exec $port \"$name\" >/dev/null 2>&1 # reset_${port}") | crontab -
+            # [Bug11 Fix] 使用 BASH_SOURCE 而非 $0
+            self_path=$(readlink -f "${BASH_SOURCE[0]}")
+            (crontab -l 2>/dev/null; echo "0 0 $d * * /bin/bash ${self_path} reset_port_exec $port \"$name\" >/dev/null 2>&1 # reset_${port}") | crontab -
         fi
         echo -e "${GREEN}设置成功${PLAIN}"
         echo -e "" 
@@ -3459,13 +4116,32 @@ script_mgr() {
         2) 
             echo -e "${GREEN}正在更新脚本...${PLAIN}"
             echo -e ""
-            # wget -> 成功提示(无前置空行) -> 输出一个空行 -> 延时 -> 重启
-            wget -N --no-check-certificate "https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh" && chmod +x singbox.sh && \
-            echo -e "${GREEN}更新成功！正在重启脚本...${PLAIN}" && \
-            echo -e "" && \
-            sleep 1 && \
-            exec ./singbox.sh
-            exit 0
+            # [Bug9 Fix] 覆盖真实运行路径（而不是当前工作目录下的 singbox.sh），同时刷新 /usr/bin/sb 软链
+            current_script=$(readlink -f "${BASH_SOURCE[0]}")
+            if [[ -z "$current_script" ]]; then
+                current_script="$(pwd)/singbox.sh"
+            fi
+            tmp_script="${current_script}.new"
+            if wget -N --no-check-certificate -O "$tmp_script" "https://raw.githubusercontent.com/SHINYUZ/sing-box/main/singbox.sh" \
+               && [[ -s "$tmp_script" ]] \
+               && head -n 1 "$tmp_script" | grep -q "^#!"; then
+                mv "$tmp_script" "$current_script"
+                chmod +x "$current_script"
+                # 保证 /usr/bin/sb 仍然指向真实脚本
+                ln -sf "$current_script" /usr/bin/sb
+                chmod +x /usr/bin/sb
+                echo -e "${GREEN}更新成功！正在重启脚本...${PLAIN}"
+                echo -e ""
+                sleep 1
+                exec /bin/bash "$current_script"
+            else
+                rm -f "$tmp_script"
+                echo -e "${RED}更新失败！请检查网络连接，或手动下载脚本。${PLAIN}"
+                echo -e ""
+                read -n 1 -s -r -p "按任意键返回..."
+                echo -e ""
+                echo -e ""
+            fi
             ;;
         3) uninstall ;;
     esac
@@ -3533,12 +4209,13 @@ uninstall() {
 
 if [[ "$1" == "reset_port_exec" ]]; then
     ensure_block_chain
-    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $2 drop" | awk '{print $NF}') 2>/dev/null
-    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $2 drop" | awk '{print $NF}') 2>/dev/null
-    nft delete rule inet singbox_stats input_counter handle $(nft -a list chain inet singbox_stats input_counter | grep "tcp dport $2" | awk '{print $NF}') 2>/dev/null
-    nft delete rule inet singbox_stats output_counter handle $(nft -a list chain inet singbox_stats output_counter | grep "tcp sport $2" | awk '{print $NF}') 2>/dev/null
-    nft delete rule inet singbox_stats input_counter handle $(nft -a list chain inet singbox_stats input_counter | grep "udp dport $2" | awk '{print $NF}') 2>/dev/null
-    nft delete rule inet singbox_stats output_counter handle $(nft -a list chain inet singbox_stats output_counter | grep "udp sport $2" | awk '{print $NF}') 2>/dev/null
+    # [Bug6 Fix] 同端口可能有多条残留规则，必须循环按单个 handle 删除
+    sb_nft_del_all sb_block       input          "tcp dport $2 drop"
+    sb_nft_del_all sb_block       input          "udp dport $2 drop"
+    sb_nft_del_all singbox_stats  input_counter  "tcp dport $2"
+    sb_nft_del_all singbox_stats  output_counter "tcp sport $2"
+    sb_nft_del_all singbox_stats  input_counter  "udp dport $2"
+    sb_nft_del_all singbox_stats  output_counter "udp sport $2"
     nft add rule inet singbox_stats input_counter tcp dport $2 counter
     nft add rule inet singbox_stats output_counter tcp sport $2 counter
     nft add rule inet singbox_stats input_counter udp dport $2 counter
@@ -3547,40 +4224,7 @@ if [[ "$1" == "reset_port_exec" ]]; then
     exit 0
 fi
 
-if [[ "$1" == "monitor" ]]; then
-    init_nftables
-    ensure_block_chain
-    for file in $WORKDIR/limit_*.conf; do
-        if [[ -f "$file" ]]; then
-            port=${file#*limit_}
-            port=${port%.conf}
-            limit_gb=$(cat "$file")
-            read rx tx <<< $(get_port_traffic "$port")
-            total=$((rx + tx))
-            limit_bytes=$((limit_gb * 1024 * 1024 * 1024))
-            if [[ $total -ge $limit_bytes ]]; then
-                ensure_block_chain
-                is_blocked=$(nft list chain inet sb_block input | grep -E "tcp dport $port drop|udp dport $port drop")
-                if [[ -z "$is_blocked" ]]; then
-                    nft add rule inet sb_block input tcp dport $port drop
-                    nft add rule inet sb_block input udp dport $port drop
-                    name=$(jq -r --argjson p "$port" '.inbounds[] | select(.listen_port == $p) | .tag' $CONFIG_FILE)
-                    used_h=$(format_bytes $total)
-                    msg="?? [????] ?? ${name} (${port}) ????? (?? ${used_h} / ?? ${limit_gb}GB)"
-                    send_tg_msg "$msg"
-                fi
-            else
-                while nft -a list chain inet sb_block input | grep -q "tcp dport $port drop"; do
-                    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
-                done
-                while nft -a list chain inet sb_block input | grep -q "udp dport $port drop"; do
-                    nft delete rule inet sb_block input handle $(nft -a list chain inet sb_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
-                done
-            fi
-        fi
-    done
-    exit 0
-fi
+# [Bug5 Fix] 已移除此处重复的 monitor 块（完整版在上方 set_traffic_quota 之后）
 
 ipv_menu() {
     echo -e "${CYAN}------------ IPv4/IPv6 优先级与策略 ------------${PLAIN}"
