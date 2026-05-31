@@ -147,8 +147,22 @@ apply_config() {
         return 0
     fi
 
-    # [Bonus Fix] sing-box 对 SIGHUP 的 reload 并不总是可靠（很多版本等于 no-op），
-    # 直接 restart 更稳妥，且需要在 restart 失败时立即暴露错误，而不是继续假装成功。
+    # 优先用 SIGHUP 热重载
+    if systemctl is-active --quiet sing-box; then
+        local sb_pid
+        sb_pid=$(systemctl show -p MainPID --value sing-box 2>/dev/null)
+        if [[ -n "$sb_pid" && "$sb_pid" -gt 1 ]]; then
+            kill -HUP "$sb_pid"
+            sleep 1
+            if systemctl is-active --quiet sing-box; then
+                [[ -n "$new_fp" ]] && echo "$new_fp" > "$SB_FP_FILE"
+                init_nftables
+                return 0
+            fi
+            echo -e "${YELLOW}热重载失败，尝试完整重启...${PLAIN}"
+        fi
+    fi
+
     if ! systemctl restart sing-box; then
         echo -e "${RED}sing-box 启动失败！${PLAIN}"
         echo -e ""
