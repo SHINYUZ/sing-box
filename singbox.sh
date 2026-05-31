@@ -135,7 +135,6 @@ apply_config() {
     fi
 
     # [Graceful Restart] 如果 config 的运行时部分没变 且 sing-box 还活着，就跳过 restart
-    # 这样可以保护所有"正在通过本机节点的 TCP 连接"（包括你的 SSH）不被误伤
     local new_fp old_fp
     new_fp=$(_sb_runtime_fingerprint)
     old_fp=""
