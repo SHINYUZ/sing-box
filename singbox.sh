@@ -3743,12 +3743,12 @@ show_traffic() {
                 fi
             fi
             if [[ -z "$status_text" ]]; then status_text="${PLAIN}正常${PLAIN}"; fi
-            v_len=$(get_visual_length "$tag")
-            pad_len=$((30 - v_len))
-            padding=$(get_padding "$pad_len")
-
-            printf "${GREEN}%d.${PLAIN}    %s%s    ${PLAIN}出↑${PLAIN} %-12s    ${PLAIN}入↓${PLAIN} %-12s    ${PLAIN}总:${PLAIN} %-12s    %b\n" \
-            "$((i+1))" "$tag" "$padding" "$tx_f" "$rx_f" "$total_f" "$status_text"
+            # 使用 ANSI 绝对列定位，避免中文、Emoji 等字符宽度差异导致各列错位。
+            printf "${GREEN}%d.${PLAIN}    %s" "$((i+1))" "$tag"
+            printf "\033[39G${PLAIN}出↑${PLAIN} %-12s" "$tx_f"
+            printf "\033[59G${PLAIN}入↓${PLAIN} %-12s" "$rx_f"
+            printf "\033[79G${PLAIN}总:${PLAIN} %-12s" "$total_f"
+            printf "\033[99G%b\n" "$status_text"
 
             if [[ $i -lt $((count-1)) ]]; then echo -e ""; fi
         done
