@@ -469,11 +469,21 @@ create_shortcut() {
 }
 
 get_random_port() {
-    if command -v shuf &> /dev/null; then
-        shuf -i 10000-65535 -n 1
-    else
-        echo $(( $(od -An -N2 -i /dev/urandom | tr -d ' ') % 55535 + 10000 ))
-    fi
+    local port
+    while true; do
+        if command -v shuf &> /dev/null; then
+            port=$(shuf -i 10000-65535 -n 1)
+        else
+            port=$(( $(od -An -N2 -i /dev/urandom | tr -d ' ') % 55536 + 10000 ))
+        fi
+
+        # 随机端口不能包含 2、4，也不能出现相邻的重复数字（如 11、55）。
+        [[ "$port" == *2* || "$port" == *4* ]] && continue
+        [[ "$port" =~ 00|11|22|33|44|55|66|77|88|99 ]] && continue
+
+        echo "$port"
+        return 0
+    done
 }
 
 show_banner() {
