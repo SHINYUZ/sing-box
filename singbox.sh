@@ -3914,9 +3914,8 @@ manage_inbound_port() {
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo -e ""
     read -r -p "选择[0-$count]: " idx
-    echo -e ""
-    echo -e ""
     if [[ "$idx" == 0 ]]; then show_traffic; return; fi
+    echo -e ""
     if [[ ! "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
         echo -e "${RED}无效序号${PLAIN}"
         echo -e ""
@@ -3957,7 +3956,7 @@ port_action_menu() {
         2) echo -e ""; if close_inbound_port "$idx"; then
                echo -e "${GREEN}端口已关闭！${PLAIN}"
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
-        0) manage_inbound_port; return ;;
+        0) echo -e ""; manage_inbound_port; return ;;
         *) port_action_menu "$idx"; return ;;
     esac
     echo -e ""
