@@ -3798,7 +3798,7 @@ show_traffic() {
             fi
             if [[ -z "$status_text" ]]; then status_text="${PLAIN}正常${PLAIN}"; fi
             if is_manually_closed "$port"; then
-                status_text="${RED}端口已关闭${PLAIN} ${status_text}"
+                status_text="${PLAIN}端口已关闭${PLAIN}"
             fi
             # 使用 ANSI 绝对列定位，避免中文、Emoji 等字符宽度差异导致各列错位。
             printf "${GREEN}%d.${PLAIN}    %s" "$((i+1))" "$tag"
@@ -3881,7 +3881,7 @@ refresh_traffic_values() {
                 status_text="${status_text} ${YELLOW}限速${rate}M${PLAIN}"
             fi
         fi
-        is_manually_closed "$port" && status_text="${RED}端口已关闭${PLAIN} ${status_text}"
+        is_manually_closed "$port" && status_text="${PLAIN}端口已关闭${PLAIN}"
         up=$((2 * count + 15 - 2 * i))
         printf '\033[u\033[%dA\033[39G出↑ %-12s\033[59G入↓ %-12s\033[79G总: %-12s\033[99G\033[K%b\033[u' \
             "$up" "$tx_f" "$rx_f" "$total_f" "$status_text"
@@ -3947,14 +3947,14 @@ port_action_menu() {
     echo -e ""
     read -p "请选择[0-2]: " opt
     case "$opt" in
-        1) if open_inbound_port "$idx"; then
+        1) echo -e ""; if open_inbound_port "$idx"; then
                if nft list chain inet sb_block input 2>/dev/null | grep -Eq "(tcp|udp) dport $port drop"; then
                    echo -e "${YELLOW}端口流量已达上限，暂无法打开。${PLAIN}"
                else
                    echo -e "${GREEN}端口已开启！${PLAIN}"
                fi
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
-        2) if close_inbound_port "$idx"; then
+        2) echo -e ""; if close_inbound_port "$idx"; then
                echo -e "${GREEN}端口已关闭！${PLAIN}"
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
         0) manage_inbound_port; return ;;
