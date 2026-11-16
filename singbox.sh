@@ -3946,17 +3946,15 @@ port_action_menu() {
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo -e ""
     read -p "请选择[0-2]: " opt
-    echo -e ""
-    echo -e ""
     case "$opt" in
-        1) if open_inbound_port "$((idx-1))"; then
+        1) if open_inbound_port "$idx"; then
                if nft list chain inet sb_block input 2>/dev/null | grep -Eq "(tcp|udp) dport $port drop"; then
                    echo -e "${YELLOW}端口流量已达上限，暂无法打开。${PLAIN}"
                else
                    echo -e "${GREEN}端口已开启！${PLAIN}"
                fi
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
-        2) if close_inbound_port "$((idx-1))"; then
+        2) if close_inbound_port "$idx"; then
                echo -e "${GREEN}端口已关闭！${PLAIN}"
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
         0) manage_inbound_port; return ;;
