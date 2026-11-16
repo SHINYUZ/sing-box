@@ -3755,7 +3755,6 @@ del_config() {
 }
 
 show_traffic() {
-    while true; do
     local separator="--------------------------------------------------------------------------------------------------------------------"
     local title=" 流量监控与限制 (Traffic Monitor) "
     local sep_len=${#separator}
@@ -3819,67 +3818,133 @@ show_traffic() {
     echo -e ""
     echo -e " ${GREEN}3.${PLAIN} 设置端口限速"
     echo -e ""
-    echo -e " ${GREEN}4.${PLAIN} 重置流量统计数据"
+    echo -e " ${GREEN}4.${PLAIN} 端口管理"
     echo -e ""
-    echo -e " ${GREEN}5.${PLAIN} 设置 Telegram 通知"
+    echo -e " ${GREEN}5.${PLAIN} 重置流量统计数据"
     echo -e ""
-    echo -e " ${GREEN}6.${PLAIN} 打开/关闭节点端口"
+    echo -e " ${GREEN}6.${PLAIN} 设置 Telegram 通知"
     echo -e ""
     echo -e " ${GREEN}0.${PLAIN} 返回上一页"
     echo -e ""
-    read -t 5 -p "选项[0-6] (每5秒自动刷新): " c
-    local read_status=$?
-    if (( read_status != 0 )); then
-        (( read_status < 128 )) && return
-        [[ -t 1 ]] && clear
-        continue
+    if [[ -t 0 && -t 1 ]]; then
+        printf '\033[s'
     fi
-    echo -e ""
-    case "$c" in
-        1) [[ -t 1 ]] && clear ;;
-        2) set_traffic_quota; return ;;
-        3) set_port_limit; return ;;
-        4) reset_traffic_menu; return ;;
-        5) setup_tg_notify; return ;;
-        6) manage_inbound_port; return ;;
-        0) menu; return ;;
-        *) [[ -t 1 ]] && clear ;;
-    esac
+    while true; do
+        read -t 5 -p "选项[0-6]: " c
+        local read_status=$?
+        if (( read_status >= 128 )); then
+            if [[ -t 0 && -t 1 ]]; then
+                refresh_traffic_values "$count"
+            fi
+            continue
+        fi
+        (( read_status != 0 )) && return
+        echo -e ""
+        case "$c" in
+            1) [[ -t 0 && -t 1 ]] && refresh_traffic_values "$count" ;;
+            2) set_traffic_quota; return ;;
+            3) set_port_limit; return ;;
+            4) manage_inbound_port; return ;;
+            5) reset_traffic_menu; return ;;
+            6) setup_tg_notify; return ;;
+            0) menu; return ;;
+            *) continue ;;
+        esac
+    done
+}
+
+# 光标停在菜单提示行；仅更新已显示的流量行，避免整屏闪烁。
+refresh_traffic_values() {
+    local count=$1 i port rx tx total rx_f tx_f total_f status_text limit l_bytes rate up
+    for ((i=0; i<count; i++)); do
+        port=$(jq -r ".inbounds[$i].listen_port" "$CONFIG_FILE")
+        read -r rx tx <<< "$(get_port_traffic "$port")"
+        total=$((rx + tx))
+        rx_f=$(format_bytes "$rx")
+        tx_f=$(format_bytes "$tx")
+        total_f=$(format_bytes "$total")
+        status_text="${PLAIN}正常${PLAIN}"
+        if [[ -f "$WORKDIR/limit_${port}.conf" ]]; then
+            limit=$(cat "$WORKDIR/limit_${port}.conf")
+            l_bytes=$((limit * 1024 * 1024 * 1024))
+            if (( total >= l_bytes )); then
+                status_text="${RED}已停用${PLAIN}"
+            else
+                status_text="${YELLOW}限${limit}G${PLAIN}"
+            fi
+        fi
+        if [[ -f "$WORKDIR/limit_rate_${port}.conf" ]] && (( ${l_bytes:-0} == 0 || total < l_bytes )); then
+            rate=$(cat "$WORKDIR/limit_rate_${port}.conf")
+            if [[ "$status_text" == "${PLAIN}正常${PLAIN}" ]]; then
+                status_text="${YELLOW}限速${rate}M${PLAIN}"
+            else
+                status_text="${status_text} ${YELLOW}限速${rate}M${PLAIN}"
+            fi
+        fi
+        is_manually_closed "$port" && status_text="${RED}端口已关闭${PLAIN} ${status_text}"
+        up=$((2 * count + 15 - 2 * i))
+        printf '\033[u\033[%dA\033[39G出↑ %-12s\033[59G入↓ %-12s\033[79G总: %-12s\033[99G\033[K%b\033[u' \
+            "$up" "$tx_f" "$rx_f" "$total_f" "$status_text"
+        l_bytes=0
     done
 }
 
 manage_inbound_port() {
     local count idx port tag i
     count=$(jq '.inbounds | length' "$CONFIG_FILE")
-    echo -e "${CYAN}------------ 节点端口管理 ------------${PLAIN}"
+    echo -e "${YELLOW}------------ 端口管理 ------------${PLAIN}"
+    echo -e ""
+    if (( count == 0 )); then
+        echo -e "${YELLOW}暂无节点${PLAIN}"
+        read -r -n 1 -s -p "按任意键返回..."
+        echo
+        show_traffic
+        return
+    fi
     for ((i=0; i<count; i++)); do
         tag=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
         port=$(jq -r ".inbounds[$i].listen_port" "$CONFIG_FILE")
         if is_manually_closed "$port"; then
-            printf ' %d. %s (%s) [已关闭]\n' "$((i+1))" "$tag" "$port"
+            printf ' %d. %s (%s) %b[已关闭]%b\n\n' "$((i+1))" "$tag" "$port" "$RED" "$PLAIN"
         else
-            printf ' %d. %s (%s) [已开放]\n' "$((i+1))" "$tag" "$port"
+            printf ' %d. %s (%s) %b[已开放]%b\n\n' "$((i+1))" "$tag" "$port" "$GREEN" "$PLAIN"
         fi
     done
-    read -r -p "选择节点序号 (0返回): " idx
+    echo -e " ${GREEN}0.${PLAIN} 返回"
+    echo -e ""
+    read -r -p "选择[0-$count]: " idx
     if [[ "$idx" == 0 ]]; then show_traffic; return; fi
     if [[ ! "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
         echo -e "${RED}无效序号${PLAIN}"
-    else
-        port=$(jq -r ".inbounds[$((idx-1))].listen_port" "$CONFIG_FILE")
-        if is_manually_closed "$port"; then
-            if open_inbound_port "$((idx-1))"; then
-                echo -e "${GREEN}端口 $port 已取消手动关闭（如已达流量限额，仍保持封禁）${PLAIN}"
-            else
-                echo -e "${RED}操作失败${PLAIN}"
-            fi
-        else
-            close_inbound_port "$((idx-1))" && echo -e "${GREEN}端口 $port 已关闭${PLAIN}" || echo -e "${RED}操作失败${PLAIN}"
-        fi
+        manage_inbound_port
+        return
     fi
+    port=$(jq -r ".inbounds[$((idx-1))].listen_port" "$CONFIG_FILE")
+    tag=$(jq -r ".inbounds[$((idx-1))].tag" "$CONFIG_FILE")
+    echo -e "${YELLOW}------------ ${tag} (${port}) ------------${PLAIN}"
+    echo -e ""
+    echo -e " ${GREEN}1.${PLAIN} 打开端口"
+    echo -e ""
+    echo -e " ${GREEN}2.${PLAIN} 关闭端口"
+    echo -e ""
+    echo -e " ${GREEN}0.${PLAIN} 返回"
+    echo -e ""
+    local action
+    read -r -p "选择[0-2]: " action
+    echo -e ""
+    case "$action" in
+        1) if open_inbound_port "$((idx-1))"; then
+               echo -e "${GREEN}端口 $port 已取消手动关闭（达到流量限额时仍保持封禁）${PLAIN}"
+           else echo -e "${RED}操作失败${PLAIN}"; fi ;;
+        2) if close_inbound_port "$((idx-1))"; then
+               echo -e "${GREEN}端口 $port 已关闭${PLAIN}"
+           else echo -e "${RED}操作失败${PLAIN}"; fi ;;
+        0) manage_inbound_port; return ;;
+        *) echo -e "${RED}无效选择${PLAIN}" ;;
+    esac
     read -r -n 1 -s -p "按任意键返回..."
     echo
-    show_traffic
+    manage_inbound_port
 }
 
 setup_tg_notify() {
