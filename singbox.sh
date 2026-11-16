@@ -651,10 +651,10 @@ get_port_traffic() {
     if ! nft list chain inet singbox_stats output_counter | grep -E "udp sport $port([^0-9]|$)" >/dev/null 2>&1; then
         nft add rule inet singbox_stats output_counter udp sport $port counter
     fi
-    rx_tcp=$(nft list chain inet singbox_stats input_counter | awk -v p="$port" '$0 ~ "tcp dport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {print sum+0}')
-    tx_tcp=$(nft list chain inet singbox_stats output_counter | awk -v p="$port" '$0 ~ "tcp sport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {print sum+0}')
-    rx_udp=$(nft list chain inet singbox_stats input_counter | awk -v p="$port" '$0 ~ "udp dport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {print sum+0}')
-    tx_udp=$(nft list chain inet singbox_stats output_counter | awk -v p="$port" '$0 ~ "udp sport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {print sum+0}')
+    rx_tcp=$(nft list chain inet singbox_stats input_counter | LC_ALL=C awk -v p="$port" '$0 ~ "tcp dport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {printf "%.0f\n", sum+0}')
+    tx_tcp=$(nft list chain inet singbox_stats output_counter | LC_ALL=C awk -v p="$port" '$0 ~ "tcp sport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {printf "%.0f\n", sum+0}')
+    rx_udp=$(nft list chain inet singbox_stats input_counter | LC_ALL=C awk -v p="$port" '$0 ~ "udp dport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {printf "%.0f\n", sum+0}')
+    tx_udp=$(nft list chain inet singbox_stats output_counter | LC_ALL=C awk -v p="$port" '$0 ~ "udp sport " p "([^0-9]|$)" {for(i=1;i<=NF;i++) if($i=="bytes") sum+=$(i+1)} END {printf "%.0f\n", sum+0}')
     rx=$(( ${rx_tcp:-0} + ${rx_udp:-0} ))
     tx=$(( ${tx_tcp:-0} + ${tx_udp:-0} ))
     echo "${rx:-0} ${tx:-0}"
