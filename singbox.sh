@@ -3890,38 +3890,54 @@ refresh_traffic_values() {
 }
 
 manage_inbound_port() {
-    local count idx port tag i
+    local count idx port tag name i
     count=$(jq '.inbounds | length' "$CONFIG_FILE")
     echo -e "${YELLOW}------------ 端口管理 ------------${PLAIN}"
     echo -e ""
     if (( count == 0 )); then
-        echo -e "${YELLOW}暂无节点${PLAIN}"
-        read -r -n 1 -s -p "按任意键返回..."
-        echo
+        echo -e "${YELLOW}暂无规则${PLAIN}"
+        echo -e ""
+        read -n 1 -s -r -p "按任意键返回..."
+        echo -e ""
+        echo -e ""
         show_traffic
         return
     fi
     for ((i=0; i<count; i++)); do
         tag=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
         port=$(jq -r ".inbounds[$i].listen_port" "$CONFIG_FILE")
-        if is_manually_closed "$port"; then
-            printf ' %d. %s (%s) %b[已关闭]%b\n\n' "$((i+1))" "$tag" "$port" "$RED" "$PLAIN"
-        else
-            printf ' %d. %s (%s) %b[已开放]%b\n\n' "$((i+1))" "$tag" "$port" "$GREEN" "$PLAIN"
-        fi
+        name="${tag}-${port}"
+        [[ "$tag" == *"-${port}" ]] && name="$tag"
+        echo -e " ${GREEN}$((i+1)).${PLAIN} ${name}"
+        echo -e ""
     done
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo -e ""
     read -r -p "选择[0-$count]: " idx
+    echo -e ""
+    echo -e ""
     if [[ "$idx" == 0 ]]; then show_traffic; return; fi
     if [[ ! "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
         echo -e "${RED}无效序号${PLAIN}"
+        echo -e ""
         manage_inbound_port
         return
     fi
-    port=$(jq -r ".inbounds[$((idx-1))].listen_port" "$CONFIG_FILE")
-    tag=$(jq -r ".inbounds[$((idx-1))].tag" "$CONFIG_FILE")
-    echo -e "${YELLOW}------------ ${tag} (${port}) ------------${PLAIN}"
+    port_action_menu "$((idx-1))"
+}
+
+port_action_menu() {
+    local idx=$1 port status opt
+    port=$(jq -r ".inbounds[$idx].listen_port" "$CONFIG_FILE")
+    status="${GREEN}running${PLAIN}"
+    ensure_block_chain
+    sync_inbound_block "$port"
+    if nft list chain inet sb_block input 2>/dev/null | grep -Eq "(tcp|udp) dport $port drop"; then
+        status="${RED}stopped${PLAIN}"
+    fi
+    echo -e "${YELLOW}------------ 端口管理 ------------${PLAIN}"
+    echo -e ""
+    echo -e " 端口: ${port}  状态: ${status}"
     echo -e ""
     echo -e " ${GREEN}1.${PLAIN} 打开端口"
     echo -e ""
@@ -3929,22 +3945,28 @@ manage_inbound_port() {
     echo -e ""
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo -e ""
-    local action
-    read -r -p "选择[0-2]: " action
+    read -p "请选择[0-2]: " opt
     echo -e ""
-    case "$action" in
+    echo -e ""
+    case "$opt" in
         1) if open_inbound_port "$((idx-1))"; then
-               echo -e "${GREEN}端口 $port 已取消手动关闭（达到流量限额时仍保持封禁）${PLAIN}"
+               if nft list chain inet sb_block input 2>/dev/null | grep -Eq "(tcp|udp) dport $port drop"; then
+                   echo -e "${YELLOW}端口流量已达上限，暂无法打开。${PLAIN}"
+               else
+                   echo -e "${GREEN}端口已开启！${PLAIN}"
+               fi
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
         2) if close_inbound_port "$((idx-1))"; then
-               echo -e "${GREEN}端口 $port 已关闭${PLAIN}"
+               echo -e "${GREEN}端口已关闭！${PLAIN}"
            else echo -e "${RED}操作失败${PLAIN}"; fi ;;
         0) manage_inbound_port; return ;;
-        *) echo -e "${RED}无效选择${PLAIN}" ;;
+        *) port_action_menu "$idx"; return ;;
     esac
-    read -r -n 1 -s -p "按任意键返回..."
-    echo
-    manage_inbound_port
+    echo -e ""
+    read -n 1 -s -r -p "按任意键返回..."
+    echo -e ""
+    echo -e ""
+    port_action_menu "$idx"
 }
 
 setup_tg_notify() {
